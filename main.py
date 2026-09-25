@@ -119,13 +119,16 @@ STRICT RULES:
 - Use ONLY facts stated in the sources. Never invent quotes, numbers, or events.
 - If something is a rumor, say "reportedly". No insults or unproven accusations.
 - Format for today: {fmt}
-- Script: 110-150 words (~45 seconds spoken). First sentence is a scroll-stopping hook.
+- Script: 70-90 words (~28 seconds spoken). First sentence is a scroll-stopping hook.
   Short punchy sentences. No emojis, no hashtags, no stage directions.
   End with a line that loops back to the hook or asks viewers to comment.
 - Title: under 70 chars, curiosity-driven, no clickbait lies. Add " #shorts".
 
 Return JSON: {{"source_index": int, "topic": "short topic label",
-"title": str, "script": str, "description": str (2-3 sentences + source link),
+"title": str, "script": str, "description": str (2 sentences, no links),
+"hook_text": "max 5 words shown big on screen at the start",
+"streamers": [Twitch usernames of the streamers in the story, lowercase, e.g. "kaicenat"],
+"hashtags": [4 topic hashtags like "#kaicenat"],
 "tags": [10 strings], "search_terms": [4 short stock-footage queries like "gaming setup neon"]}}
 
 SOURCES:
@@ -159,7 +162,12 @@ def ts(s):
     return f"{int(s // 3600)}:{int(s % 3600 // 60):02}:{s % 60:05.2f}"
 
 
-def write_ass(words, total, path):
+def ass_escape(s):
+    return s.replace("{", "(").replace("}", ")").replace("\\", "/")
+
+
+def write_ass(words, total, path, hook_text, credits):
+    """credits: list of (start, end, text) shown at the bottom while a clip plays."""
     if not words:  # fallback: spread evenly
         toks = WORK.joinpath("script.txt").read_text().split()
         step = total / len(toks)
@@ -171,21 +179,58 @@ PlayResY: 1920
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, BorderStyle, Outline, Shadow, Alignment, MarginV
 Style: Main,DejaVu Sans,96,&H00FFFFFF,&H00000000,&H80000000,1,1,7,3,5,0
+Style: Hook,DejaVu Sans,84,&H00FFFFFF,&H000000FF,&H00000000,1,3,6,0,8,260
+Style: Credit,DejaVu Sans,40,&H00FFFFFF,&H00000000,&H90000000,1,3,4,0,2,230
 
 [Events]
 Format: Layer, Start, End, Style, Text
 """
     lines = []
+    if hook_text:  # big red-boxed hook for the first 2.5s
+        lines.append(f"Dialogue: 1,{ts(0)},{ts(min(2.5, total))},Hook,"
+                     f"{{\\fad(0,200)\\fscx60\\fscy60\\t(0,150,\\fscx100\\fscy100)}}{ass_escape(hook_text.upper())}")
+    for s, e, text in credits:
+        lines.append(f"Dialogue: 1,{ts(s)},{ts(e)},Credit,{ass_escape(text)}")
     for i in range(0, len(words), 2):  # 2 words per caption
         grp = words[i:i + 2]
         end = words[i + 2][0] if i + 2 < len(words) else total
-        text = " ".join(w[2] for w in grp).upper()
+        text = ass_escape(" ".join(w[2] for w in grp).upper())
         color = "{\\c&H00F0FF&}" if i % 4 == 0 else ""  # alternate yellow/white
         lines.append(f"Dialogue: 0,{ts(grp[0][0])},{ts(end)},Main,{color}{{\\fscx110\\fscy110\\t(0,80,\\fscx100\\fscy100)}}{text}")
     path.write_text(head + "\n".join(lines), encoding="utf-8")
 
 
-# ---------- 4. Background footage ----------
+# ---------- 4. Footage ----------
+def twitch_clips(streamers, n=3):
+    """Top Twitch clips of the streamers in the story (no API keys needed) -> [(path, credit)]."""
+    urls = []
+    for name in streamers[:3]:
+        for rng in ("7d", "30d"):
+            r = subprocess.run(["yt-dlp", "--flat-playlist", "--playlist-end", "3", "--print", "url",
+                                f"https://www.twitch.tv/{name}/clips?filter=clips&range={rng}"],
+                               capture_output=True, text=True, timeout=120)
+            found = [u for u in r.stdout.split() if u.startswith("http")]
+            if found:
+                urls += [(u, name) for u in found]
+                break
+            print(f"no clips for {name} ({rng}):", r.stderr.strip()[-200:])
+    # round-robin: best clip of each streamer first, then second-best, ...
+    rank = {}
+    for i, (u, name) in enumerate(urls):
+        rank[u] = sum(1 for _, n in urls[:i] if n == name)
+    urls.sort(key=lambda x: rank[x[0]])
+    out = []
+    for u, name in urls:
+        p = WORK / f"twitch{len(out)}.mp4"
+        r = subprocess.run(["yt-dlp", "-q", "--no-part", "-f", "b", "-o", str(p), u], timeout=300)
+        if r.returncode == 0 and p.exists():
+            out.append((p, f"Clip: twitch.tv/{name}"))
+            print("twitch clip:", u)
+        if len(out) >= n:
+            break
+    return out
+
+
 def pexels_clips(terms, n=5):
     urls = []
     for q in terms + ["gaming setup", "neon city night", "esports"]:
@@ -207,29 +252,99 @@ def pexels_clips(terms, n=5):
     return paths
 
 
-def build_video(clips, total, audio, ass, out):
-    seg = total / len(clips) + 0.5
+ZOOM = "zoompan=z='min(zoom+0.0012,1.12)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30"
+FLASH = "fade=t=in:st=0:d=0.15:color=white"
+
+
+def render_part(src, wide, seg, dst):
+    """One segment: slow push-in zoom + white flash on the cut. Wide (16:9) clips sit
+    centered over a blurred copy of themselves instead of being cropped."""
+    if wide:
+        fc = ("[0:v]fps=30,split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,"
+              "crop=1080:1920,boxblur=20:2,eq=brightness=-0.15[bg];[b]scale=1080:-2[fg];"
+              f"[bg][fg]overlay=(W-w)/2:(H-h)/2,{ZOOM},{FLASH}[v]")
+    else:
+        fc = (f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,"
+              f"eq=brightness=-0.08,{ZOOM},{FLASH}[v]")
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-stream_loop", "-1", "-i", str(src), "-t", f"{seg:.2f}",
+                    "-filter_complex", fc, "-map", "[v]", "-an", "-c:v", "libx264", "-preset", "veryfast",
+                    str(dst)], check=True)
+
+
+def make_whoosh(path):
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anoisesrc=d=0.45:c=pink:a=0.5",
+                    "-af", "highpass=f=500,lowpass=f=5000,afade=t=in:d=0.2,afade=t=out:st=0.2:d=0.25",
+                    str(path)], check=True)
+
+
+MUSIC_MOODS = ["upbeat", "energetic", "electronic", "hip hop", "action", "epic",
+               "dramatic", "trailer", "funky", "edm"]
+
+
+def pick_music():
+    """Find a fresh free track online (Openverse: CC0 / CC-BY only, safe for YouTube with
+    credit). Falls back to any mp3s in a local music/ folder. -> (path, credit) or (None, None)"""
+    mood = random.choice(MUSIC_MOODS)
+    try:
+        r = requests.get("https://api.openverse.org/v1/audio/", headers=UA, timeout=30, params={
+            "q": mood, "license": "cc0,by", "category": "music", "page_size": 20})
+        r.raise_for_status()
+        tracks = [t for t in r.json().get("results", [])
+                  if (t.get("duration") or 0) >= 40000 and t.get("url")]
+        random.shuffle(tracks)
+        for t in tracks[:5]:
+            try:
+                data = requests.get(t["url"], headers=UA, timeout=60).content
+                if len(data) < 100_000:
+                    continue
+                p = WORK / "music_dl"
+                p.write_bytes(data)
+                duration(p)  # make sure ffmpeg can read it
+                lic = f"CC {t['license'].upper()} {t.get('license_version') or ''}".strip()
+                print(f"Music ({mood}): {t['title']} by {t['creator']}")
+                return p, f"Music: \"{t['title']}\" by {t['creator']} ({lic}) {t.get('foreign_landing_url', '')}"
+            except Exception as e:
+                print("track failed:", e)
+    except Exception as e:
+        print("music search failed:", e)
+    local = sorted((ROOT / "music").glob("*.mp3"))
+    return (random.choice(local), None) if local else (None, None)
+
+
+def build_video(segments, seg, total, audio, ass, out, music=None):
+    """segments: [(path, wide)] each shown for `seg` seconds."""
     parts = []
-    for k, c in enumerate(clips):
+    for k, (src, wide) in enumerate(segments):
         p = WORK / f"part{k}.mp4"
-        subprocess.run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(c), "-t", f"{seg:.2f}",
-                        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,eq=brightness=-0.08",
-                        "-an", "-c:v", "libx264", "-preset", "veryfast", str(p)], check=True)
+        render_part(src, wide, seg + 0.1, p)
         parts.append(p)
     lst = WORK / "list.txt"
     lst.write_text("".join(f"file '{p.name}'\n" for p in parts))
     bg = WORK / "bg.mp4"
-    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(bg)],
-                   check=True)
-    music = ROOT / "music.mp3"
-    cmd = ["ffmpeg", "-y", "-i", str(bg), "-i", str(audio)]
-    if music.exists():
-        cmd += ["-stream_loop", "-1", "-i", str(music), "-filter_complex",
-                "[2:a]volume=0.12[m];[1:a][m]amix=inputs=2:duration=first[a]", "-map", "0:v", "-map", "[a]"]
-    else:
-        cmd += ["-map", "0:v", "-map", "1:a"]
-    cmd += ["-vf", f"ass={ass.name}", "-t", f"{total + 0.3:.2f}", "-c:v", "libx264", "-preset", "medium",
-            "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", str(out)]
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(lst),
+                    "-c", "copy", str(bg)], check=True)
+
+    whoosh = WORK / "whoosh.wav"
+    make_whoosh(whoosh)
+    cuts = [k * seg for k in range(1, len(segments))]
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(bg), "-i", str(audio)]
+    for _ in cuts:
+        cmd += ["-i", str(whoosh)]
+    fc = []
+    mix = ["[1:a]"]
+    for n, t in enumerate(cuts):
+        ms = max(0, int((t - 0.2) * 1000))  # whoosh leads into the cut
+        fc.append(f"[{n + 2}:a]adelay={ms}|{ms},volume=0.5[w{n}]")
+        mix.append(f"[w{n}]")
+    if music:
+        cmd += ["-stream_loop", "-1", "-i", str(music)]
+        fc.append(f"[{len(cuts) + 2}:a]volume=0.13,afade=t=out:st={max(0, total - 1.5):.2f}:d=1.5[m]")
+        mix.append("[m]")
+    fc.append(f"{''.join(mix)}amix=inputs={len(mix)}:duration=first:normalize=0[a]")
+    fc.append(f"[0:v]ass={ass.name}[v]")
+    cmd += ["-filter_complex", ";".join(fc), "-map", "[v]", "-map", "[a]",
+            "-t", f"{total + 0.3:.2f}", "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", str(out)]
     subprocess.run(cmd, check=True, cwd=WORK)
 
 
@@ -244,8 +359,14 @@ def upload(path, meta):
                         client_id=os.environ["YT_CLIENT_ID"],
                         client_secret=os.environ["YT_CLIENT_SECRET"])
     yt = build("youtube", "v3", credentials=creds)
+    tags = [t if t.startswith("#") else "#" + t for t in meta.get("hashtags", [])]
+    hashtags = " ".join(dict.fromkeys(["#shorts", "#viral", "#streamer", "#twitch", "#fyp"] +
+                                      [t.replace(" ", "") for t in tags]))
+    credits = "\n".join(meta.get("credits", [])) or "Footage: Pexels"
+    desc = (f"{meta['description']}\n\nCredits:\n{credits}\nNews source: {meta['source']['url']}\n\n"
+            f"All clips belong to their respective creators.\n\n{hashtags}")
     body = {"snippet": {"title": meta["title"][:100],
-                        "description": f"{meta['description']}\n\nSource: {meta['source']['url']}",
+                        "description": desc[:4900],
                         "tags": meta["tags"], "categoryId": "20"},
             "status": {"privacyStatus": os.environ.get("YT_PRIVACY", "public"),
                        "selfDeclaredMadeForKids": False}}
@@ -267,13 +388,23 @@ def main():
     audio = WORK / "voice.mp3"
     words = asyncio.run(tts(meta["script"], audio))
     total = duration(audio)
-    ass = WORK / "subs.ass"
-    write_ass(words, total, ass)
 
-    clips = pexels_clips(meta["search_terms"])
-    random.shuffle(clips)
+    # Real Twitch clips of the streamers first, stock footage fills the rest.
+    tw = twitch_clips([s.lower().strip() for s in meta.get("streamers", [])])
+    stock = pexels_clips(meta["search_terms"], n=max(2, 6 - len(tw)))
+    random.shuffle(stock)
+    segments = [(p, True) for p, _ in tw] + [(p, False) for p in stock]
+    segments = segments[:6]
+    seg = total / len(segments)
+    credit_marks = [(k * seg, (k + 1) * seg, c) for k, (_, c) in enumerate(tw)]
+    music, music_credit = pick_music()
+    meta["credits"] = ([c for _, c in tw] + (["Stock footage: Pexels"] if stock else [])
+                       + ([music_credit] if music_credit else []))
+
+    ass = WORK / "subs.ass"
+    write_ass(words, total, ass, meta.get("hook_text", ""), credit_marks)
     out = WORK / "final.mp4"
-    build_video(clips, total, audio, ass, out)
+    build_video(segments, seg, total, audio, ass, out, music)
 
     vid = None if DRY_RUN else upload(out, meta)
     history.append({"date": str(dt.date.today()), "topic": meta["topic"], "title": meta["source"]["title"],

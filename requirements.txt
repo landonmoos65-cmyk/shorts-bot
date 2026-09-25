@@ -1,4 +1,5 @@
 requests
+yt-dlp
 edge-tts>=7.0
 google-api-python-client
 google-auth
