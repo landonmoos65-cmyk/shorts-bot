@@ -8,6 +8,7 @@ Pipeline:
   -> FFmpeg (captions, zooms, whooshes, music) -> YouTube upload.
 """
 import asyncio
+import base64
 import datetime as dt
 import json
 import os
@@ -119,8 +120,12 @@ def gemini_models():
     return _models
 
 
-def gemini(prompt, temperature=0.9):
-    body = {"contents": [{"parts": [{"text": prompt}]}],
+def gemini(prompt, temperature=0.9, images=()):
+    """images: jpeg file paths sent along with the prompt (Gemini can see them)."""
+    parts = [{"text": prompt}] + [
+        {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(Path(p).read_bytes()).decode()}}
+        for p in images]
+    body = {"contents": [{"parts": parts}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": temperature}}
     models = gemini_models()
     dead = set()  # models with no free quota (429) - don't retry those
@@ -248,6 +253,25 @@ def download_clip(c, path):
     return ok
 
 
+def contact_sheet(c, k, times=None):
+    """One jpeg with 3 frames side by side (default 20%, 50%, 80% through the clip), so Gemini can
+    see what the clip actually shows (face cam / IRL vs. gameplay)."""
+    dst = WORK / f"sheet{k}.jpg"
+    d = max(c["duration"], 3)
+    inputs = []
+    for t in times or (d * 0.2, d * 0.5, d * 0.8):
+        inputs += ["-ss", f"{max(0, t):.1f}", "-i", str(c["path"])]
+    try:
+        subprocess.run(["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex",
+                        "[0:v]scale=480:-2,trim=end_frame=1[a];[1:v]scale=480:-2,trim=end_frame=1[b];"
+                        "[2:v]scale=480:-2,trim=end_frame=1[c];[a][b][c]hstack=3[v]",
+                        "-map", "[v]", "-frames:v", "1", "-q:v", "4", str(dst)], check=True, timeout=60)
+        return dst
+    except Exception as e:
+        print("contact sheet failed:", e)
+        return None
+
+
 def credit_for(c):
     return f"Clip: {c['platform']}.{'tv' if c['platform'] == 'twitch' else 'com'}/{c['user']}"
 
@@ -280,7 +304,7 @@ def as_timestamped_text(words):
     return "\n".join(out)
 
 
-def pick_candidates(story, clips, n=4):
+def pick_candidates(story, clips, n=6):
     """Ask Gemini which clips (by title) most likely show the moment; then add top-viewed ones."""
     if not clips:
         return []
@@ -304,10 +328,14 @@ CLIPS:
 
 
 # ---------- 4. Script ----------
-def write_script(story, clips):
-    blocks = []
+def write_script(story, clips, feedback=None, no_clip=False):
+    blocks, images = [], []
     for i, c in enumerate(clips):
-        blocks.append(f"CLIP [{i}] {c['platform']}/{c['user']} \"{c['title']}\" ({c['duration']:.0f}s)\n"
+        seen = "no image"
+        if c.get("sheet"):
+            images.append(c["sheet"])
+            seen = f"IMAGE #{len(images)} shows 3 frames from it"
+        blocks.append(f"CLIP [{i}] {c['platform']}/{c['user']} \"{c['title']}\" ({c['duration']:.0f}s) - {seen}\n"
                       + (as_timestamped_text(c["words"]) if c["words"] else "(no speech)"))
     formats = "\n".join(f"  - {f}" for f in FORMATS)
     prompt = f"""You write viral YouTube Shorts about streamers. The Short = [narrated intro] + [the REAL
@@ -318,10 +346,16 @@ STORY: {story['source']['title']} | {story['source']['text']}
 TRANSCRIBED CLIPS of the streamer(s) (timestamps in seconds):
 {chr(10).join(blocks) or '(none)'}
 
+The attached images are frames from the clips (IMAGE #1, #2, ... in the order listed). USE THEM:
+a clip is only RELEVANT if what you SEE and HEAR fits the story - e.g. the people/place/event in
+the story, or the streamer on face cam / IRL talking about it. Plain gameplay (Fortnite, GTA,
+Minecraft...), other people, or unrelated streams are NOT relevant, even if it's the right streamer.
+
 STEP 1 - choose the clip:
-- clip_index = the clip that actually shows THIS story's moment, or the streamer talking/reacting about it.
-  If none clearly relates, pick the clip with the most intense/funny/shocking lines from the MAIN
-  streamer and set "clip_relates": false. If no clip has usable speech, clip_index = -1.
+- clip_index = the RELEVANT clip that actually shows THIS story's moment, or the streamer on camera
+  talking/reacting about it. If none clearly relates, you may pick a clip of the MAIN streamer on
+  camera (face visible, not gameplay) with intense/funny lines and set "clip_relates": false.
+  If there is no such clip, clip_index = -1.
 - clip_start/clip_end: 8-18 seconds, cut at sentence boundaries using the timestamps, containing
   the strongest lines. Don't start mid-sentence.
 
@@ -338,14 +372,64 @@ STEP 2 - write:
 RULES: facts ONLY from the story and transcripts. Never invent quotes/numbers/events. Rumors =
 "reportedly". No insults or unproven accusations. No emojis/hashtags/stage directions in speech.
 
+- broll: indices of OTHER clips that are also relevant and fine to show silently behind the
+  narration (streamer's face/IRL, the people or event in the story). Exclude gameplay-only and
+  unrelated clips. [] is fine - we'd rather reuse the main clip than show something off-topic.
+
 Return JSON: {{"clip_index": int, "clip_relates": bool, "clip_start": float, "clip_end": float,
+"broll": [int],
 "intro": str, "outro": str,
 "title": "under 60 chars, names the streamer, curiosity, not a lie, ends with ' #shorts'",
 "description": "2 sentences, no links", "hook_text": "max 5 words shown big at the start",
 "clip_label": "max 4 words shown on top while the clip plays, e.g. 'N3ON vs STRICKLAND'",
 "hashtags": [4 topic hashtags], "tags": [10 strings],
 "search_terms": [3 stock-footage queries, only used if we have no clips]}}"""
-    return gemini(prompt, temperature=0.7)
+    if feedback:
+        prompt += ("\n\nA FACT-CHECKER REJECTED YOUR LAST ATTEMPT. Fix every problem (pick a different "
+                   "clip or seconds, or reword the intro so it only promises what the clip really shows):\n"
+                   + "\n".join(f"- {p}" for p in feedback))
+    if no_clip:
+        prompt += ("\n\nNO CLIP PASSED THE FACT-CHECK. Set clip_index = -1 (narration only) and write the "
+                   "full 60-80 word script as the intro. You may still list relevant broll clips.")
+    return gemini(prompt, temperature=0.7, images=images)
+
+
+def verify(story, meta, clip, attempt):
+    """Fact-check: does the clip segment really deliver what the narration promises?
+    -> (passed, [problems])"""
+    cs, ce = float(meta.get("clip_start") or 0), float(meta.get("clip_end") or 0)
+    said = " ".join(w for s, e, w in clip["words"] if s >= cs - 0.3 and e <= ce + 0.3) or "(no speech)"
+    before = " ".join(w for s, e, w in clip["words"] if cs - 8 <= s < cs - 0.3)
+    after = " ".join(w for s, e, w in clip["words"] if ce + 0.3 < e <= ce + 6)
+    sheet = contact_sheet(clip, f"verify{attempt}", times=(cs + 0.5, (cs + ce) / 2, ce - 0.5))
+    data = gemini(f"""You are a strict fact-checker for a streamer-news YouTube Short. Be skeptical.
+
+NEWS STORY: {story['source']['title']} | {story['source']['text']}
+STREAMERS IN THE STORY: {[s.get('name') for s in story['streamers']]}
+
+THE VIDEO:
+1. Narrator intro: "{meta.get('intro')}"
+2. Then a clip from {clip['platform']}.{'tv' if clip['platform'] == 'twitch' else 'com'}/{clip['user']} plays,
+   with the on-screen label "{meta.get('clip_label')}".
+   EXACT words spoken in the part we show ({cs:.1f}s-{ce:.1f}s): "{said}"
+   (just before it: "...{before}")  (just after it: "{after}...")
+   The attached image = 3 frames from the start, middle and end of that part.
+3. Narrator outro: "{meta.get('outro')}"
+4. Title: "{meta.get('title')}"
+
+CHECK EVERY ONE:
+a) Does the clip part actually deliver what the intro promises? If the intro says "here's what X
+   said about Y" / "listen to his response" / "watch what happened", the words and frames must
+   really be X's response about Y / that event - not a random moment, not a different topic.
+b) Is the person speaking/shown plausibly the streamer the video claims? (channel, frames, words)
+c) Does the part start and end cleanly (not mid-sentence, the key line isn't cut off)?
+d) Are all facts in intro/outro/title/label supported by the news story or the transcript?
+   Any invented quote, number or event = fail.
+e) Nothing misleading: the label and title must not claim more than the clip shows.
+
+Return JSON: {{"pass": bool, "problems": ["specific problem + how to fix it"]}}""",
+                  temperature=0.1, images=[sheet] if sheet else [])
+    return bool(data.get("pass")), [str(p) for p in data.get("problems", [])]
 
 
 # ---------- 5. Voice + captions ----------
@@ -628,23 +712,40 @@ def main():
             except Exception as e:
                 print("transcribe failed:", e)
                 c["words"] = []
+            c["sheet"] = contact_sheet(c, len(clips))
             clips.append(c)
     print(f"{len(clips)} clips ready")
 
-    meta = write_script(story, clips)
+    # Write -> fact-check -> rewrite (up to 3 tries). If no clip passes, go narration-only.
+    feedback = None
+    for attempt in range(4):
+        meta = write_script(story, clips, feedback, no_clip=attempt == 3)
+        idx = meta.get("clip_index", -1)
+        main_clip = clips[idx] if isinstance(idx, int) and 0 <= idx < len(clips) else None
+        if not main_clip or attempt == 3:  # final try is always narration-only
+            main_clip = None
+            break
+        passed, problems = verify(story, meta, main_clip, attempt)
+        print(f"Fact-check #{attempt + 1}: {'PASSED' if passed else 'FAILED'}", *problems, sep="\n  ")
+        if passed:
+            break
+        feedback = problems
     meta.update(source=story["source"], topic=story["topic"])
-    idx = meta.get("clip_index", -1)
-    main_clip = clips[idx] if isinstance(idx, int) and 0 <= idx < len(clips) else None
     print("Title:", meta["title"])
     print("Intro:", meta["intro"])
     print("Clip:", main_clip and f"{main_clip['url']} {meta.get('clip_start')}-{meta.get('clip_end')}s "
           f"(relates: {meta.get('clip_relates')})")
     print("Outro:", meta.get("outro"))
 
-    # B-roll = the streamer's other clips (muted). Stock footage only if we have no clips at all.
-    broll = [(c["path"], 3.0 if c["duration"] > 10 else 0.0) for c in clips if c is not main_clip]
+    # B-roll = only the clips Gemini judged relevant (it saw frames from each), shown muted.
+    # None relevant -> reuse other moments of the main clip. Stock only if there are no clips at all.
+    ok = [i for i in meta.get("broll", []) if isinstance(i, int) and 0 <= i < len(clips)]
+    broll_clips = [clips[i] for i in ok if clips[i] is not main_clip]
+    print("B-roll clips:", [c["url"] for c in broll_clips] or "none relevant - reusing main clip")
+    broll = [(c["path"], 3.0 if c["duration"] > 10 else 0.0) for c in broll_clips]
     if not broll and main_clip:
-        broll = [(main_clip["path"], 0.0)]
+        d, cs = main_clip["duration"], float(meta.get("clip_start") or 0)
+        broll = [(main_clip["path"], s) for s in dict.fromkeys([0.0, max(0.0, cs - 6), min(d * 0.6, d - 5)])]
     stock_used = False
     if not broll:
         broll = [(p, 0.0) for p in pexels_clips(meta.get("search_terms", []))]
@@ -657,7 +758,8 @@ def main():
     intro_words = tts(meta["intro"], intro_mp3)
     t1 = duration(intro_mp3)
     pieces, sections, words, overlays = [(intro_mp3, 0, t1)], split_broll(broll, t1), list(intro_words), []
-    credits = [credit_for(c) for c in clips] + (["Stock footage: Pexels"] if stock_used else [])
+    credits = ([credit_for(c) for c in [main_clip] + broll_clips if c]
+               + (["Stock footage: Pexels"] if stock_used else []))
     duck = None
 
     if main_clip:
