@@ -53,17 +53,53 @@ def fetch_reddit():
     return items
 
 
+# The names people actually search for. Stories about them get far more views.
+BIG_STREAMERS = [
+    "Kai Cenat", "IShowSpeed", "xQc", "Adin Ross", "Pokimane", "Ninja", "MrBeast", "Dr Disrespect",
+    "Hasan Piker", "Asmongold", "Ludwig", "Valkyrae", "Sketch", "Jynxzi", "Duke Dennis", "Fanum",
+    "Agent 00", "Caseoh", "Tfue", "Shroud", "TimTheTatman", "Summit1g", "Amouranth", "Sneako",
+    "N3on", "Clix", "Plaqueboymax", "Stable Ronaldo", "Lacy", "Emiru", "Ibai", "Mizkif",
+    "Moistcr1tikal", "Tyler1", "Sykkuno", "Faze Banks", "Jake Paul", "Kick streamer",
+]
+HOOK_WORDS = ["banned", "record", "drama", "arrested", "leaves", "quits", "million", "lawsuit",
+              "apologizes", "reacts", "exposed", "breaks", "subathon", "signs", "returns", "fight"]
+# Names that also mean other things (Ninja blenders, BBC's "Ludwig", ...) need a streaming word nearby.
+AMBIGUOUS = {"ninja", "ludwig", "sketch", "lacy", "shroud", "clix", "ibai", "fanum", "kick streamer"}
+STREAM_WORDS = ["stream", "twitch", "kick", "youtuber", "subathon", "clip", "creator", "influencer", "chat"]
+JUNK_WORDS = ["air fryer", "blender", "knife", "deal", "sale", "% off", "review:", "prime day",
+              "appliance", "vacuum", "cookware", "stock price", "earnings"]
+
+
 def fetch_google_news():
-    items = []
-    for q in ("twitch streamer", "kick streamer", "youtube streamer", "streamer record"):
+    queries = [(q, None) for q in ["twitch streamer banned", "streamer drama", "streamer record",
+                                    "kick streamer", "twitch subathon", "streamer million deal"]]
+    queries += [(f'"{n}" streamer', n.lower()) for n in random.sample(BIG_STREAMERS, 14)]
+    items, seen = [], set()
+    for q, name in queries:
         try:
             url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}+when:2d&hl=en-US&gl=US&ceid=US:en"
             root = ET.fromstring(requests.get(url, headers=UA, timeout=15).content)
-            for it in root.iter("item"):
-                items.append({"title": it.findtext("title"), "url": it.findtext("link"),
-                              "text": it.findtext("description", "")[:800], "score": 0})
+            for it in list(root.iter("item"))[:8]:
+                title = it.findtext("title") or ""
+                low = title.lower()
+                if low in seen or any(w in low for w in JUNK_WORDS):
+                    continue
+                if name and (name not in low or
+                             (name in AMBIGUOUS and not any(w in low for w in STREAM_WORDS))):
+                    continue
+                seen.add(title.lower())
+                items.append({"title": title, "url": it.findtext("link"),
+                              "text": f"({it.findtext('pubDate')}) " + (it.findtext("description") or "")[:600],
+                              "score": 0})
         except Exception as e:
             print(f"news '{q}' failed: {e}")
+    # Pre-rank: famous names + dramatic words + how many outlets cover the same person (= trending)
+    names = [n.lower() for n in BIG_STREAMERS]
+    buzz = {n: sum(n in i["title"].lower() for i in items) for n in names}
+    for i in items:
+        t = i["title"].lower()
+        i["score"] = (sum(3 + buzz[n] for n in names if n in t)
+                      + sum(2 for w in HOOK_WORDS if w in t))
     return items
 
 
@@ -127,23 +163,37 @@ def write_script(items, history):
     fresh.sort(key=lambda i: i["score"], reverse=True)
     if not fresh:
         sys.exit("No fresh sources today.")
-    fmt = FORMATS[dt.date.today().toordinal() % len(FORMATS)]
     recent = [h["topic"] for h in history[-30:]]
     sources = "\n".join(f"[{n}] {i['title']} | {i['text']} | {i['url']}"
-                        for n, i in enumerate(fresh[:40]))
-    prompt = f"""You write viral YouTube Shorts about streamers (Twitch, Kick, YouTube).
-Pick ONE story from the sources below that is interesting and NOT about these recent topics: {recent}
+                        for n, i in enumerate(fresh[:45]))
+    formats = "\n".join(f"  - {f}" for f in FORMATS)
+    prompt = f"""You run a streamer-news Shorts channel whose videos get millions of views.
+Your #1 job: pick the ONE story below that the most people will stop scrolling for.
+
+HOW TO PICK (in this order):
+1. A famous streamer most teens/young adults know (Kai Cenat, IShowSpeed, xQc, Adin Ross, etc).
+   Unknown/small streamers = reject.
+2. High-emotion event: ban, drama, beef, arrest, lawsuit, huge money, broken record, quitting,
+   shocking moment, massive collab, platform switch. Boring = reject (earnings reports, esports
+   roster changes, hardware, "top 10" listicles, local news, game updates).
+3. Fresh: happened in the last 24-48h and people are talking about it (several outlets cover it).
+4. NOT a repeat of these recent topics: {recent}
 
 STRICT RULES:
 - Use ONLY facts stated in the sources. Never invent quotes, numbers, or events.
 - If something is a rumor, say "reportedly". No insults or unproven accusations.
-- Format for today: {fmt}
-- Script: 70-90 words (~28 seconds spoken). First sentence is a scroll-stopping hook.
-  Short punchy sentences. No emojis, no hashtags, no stage directions.
-  End with a line that loops back to the hook or asks viewers to comment.
-- Title: under 70 chars, curiosity-driven, no clickbait lies. Add " #shorts".
+- Pick whichever format fits the story best:
+{formats}
+- Script: 70-90 words (~28 seconds spoken). Short punchy sentences. No emojis/hashtags/stage directions.
+  SENTENCE 1 IS EVERYTHING: name the streamer + the most shocking fact in under 12 words.
+  Good hooks: "Kai Cenat just got banned... for the fourth time." / "IShowSpeed just broke
+  a record nobody thought was possible." / "xQc lost $2 million in one night."
+  Build tension in the middle (open a question, answer it late). No filler like "hey guys" or
+  "in today's video". End with a punchy question that makes people comment.
+- Title: under 60 chars, names the streamer, creates curiosity, not a lie. Add " #shorts".
+- viral_score: honest 1-10 of how viral this story is.
 
-Return JSON: {{"source_index": int, "topic": "short topic label",
+Return JSON: {{"source_index": int, "viral_score": int, "topic": "short topic label",
 "title": str, "script": str, "description": str (2 sentences, no links),
 "hook_text": "max 5 words shown big on screen at the start",
 "streamers": [Twitch usernames of the streamers in the story, lowercase, e.g. "kaicenat"],
@@ -401,7 +451,7 @@ def main():
     items = fetch_reddit() + fetch_google_news()
     print(f"{len(items)} source items")
     meta = write_script(items, history)
-    print("Topic:", meta["topic"], "\nTitle:", meta["title"], "\n", meta["script"])
+    print("Topic:", meta["topic"], f"(viral score {meta.get('viral_score')}/10)", "\nTitle:", meta["title"], "\n", meta["script"])
     (WORK / "script.txt").write_text(meta["script"], encoding="utf-8")
 
     audio = WORK / "voice.mp3"
