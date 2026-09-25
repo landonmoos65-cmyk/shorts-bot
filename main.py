@@ -98,6 +98,39 @@ def load_history():
     return json.loads(HISTORY.read_text()) if HISTORY.exists() else []
 
 
+def update_views(history, max_checks=15):
+    """Refresh view counts of our Shorts from the last 2-21 days (public page, no extra keys)."""
+    today = dt.date.today()
+    todo = [h for h in history if h.get("video") and
+            2 <= (today - dt.date.fromisoformat(h["date"])).days <= 21][-max_checks:]
+    for h in todo:
+        r = subprocess.run([sys.executable, "-m", "yt_dlp", "--skip-download", "--print", "view_count",
+                            f"https://www.youtube.com/shorts/{h['video']}"],
+                           capture_output=True, text=True, timeout=90)
+        v = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+        if v.isdigit():
+            h["views"] = int(v)
+    if todo:
+        print("Views updated:", [(h.get("streamer"), h.get("views")) for h in todo])
+
+
+def performance(history):
+    """-> ({streamer: avg views}, text summary of what worked, for Gemini)."""
+    rated = [h for h in history if h.get("views") is not None and h.get("streamer")]
+    if len(rated) < 3:
+        return {}, "(not enough data yet)"
+    by = {}
+    for h in rated:
+        by.setdefault(h["streamer"], []).append(h["views"])
+    avg = {s: sum(v) / len(v) for s, v in by.items()}
+    best = sorted(rated, key=lambda h: h["views"], reverse=True)
+    lines = [f"- {h['views']} views: {h['streamer']} - {h.get('topic')} (title: {h.get('yt_title')})"
+             for h in best[:5]]
+    if len(best) > 8:
+        lines += ["WORST:"] + [f"- {h['views']} views: {h['streamer']} - {h.get('topic')}" for h in best[-3:]]
+    return avg, "\n".join(lines)
+
+
 # ---------- 2. Gemini ----------
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 _models = None
@@ -211,11 +244,18 @@ STREAMER_ACCOUNTS = {
 }
 
 
-def find_trending_clips(history, n_streamers=18, keep=8):
+def find_trending_clips(history, avg_views=None, n_streamers=18, keep=8):
     """This week's most-viewed clips from a random set of big streamers -> best `keep` candidates
-    (max 2 per streamer, never a clip we already used)."""
+    (max 2 per streamer, never a clip we already used). Streamers whose Shorts did well on our
+    channel get picked more often; flops less often (but never zero - tastes change)."""
     used = {h.get("clip") for h in history} | {h.get("url") for h in history}
-    names = random.sample(list(STREAMER_ACCOUNTS), min(n_streamers, len(STREAMER_ACCOUNTS)))
+    avg_views = avg_views or {}
+    overall = sum(avg_views.values()) / len(avg_views) if avg_views else 1
+    weight = {n: min(4.0, max(0.3, avg_views[n] / overall)) if n in avg_views and overall else 1.0
+              for n in STREAMER_ACCOUNTS}
+    # weighted sampling without replacement
+    names = sorted(STREAMER_ACCOUNTS, key=lambda n: random.random() ** (1 / weight[n]), reverse=True)
+    names = names[:n_streamers]
     pool = []
     for name in names:
         tw, kk = STREAMER_ACCOUNTS[name]
@@ -321,6 +361,10 @@ RECENT NEWS about these streamers (context only - use it if it explains a clip):
 
 Topics we already covered recently (don't repeat): {story['recent']}
 
+HOW OUR PAST SHORTS PERFORMED (learn from it - favor the kinds of streamers/moments/titles that
+got views, avoid what flopped):
+{story.get('perf') or '(not enough data yet)'}
+
 CLIPS (timestamps in seconds):
 {chr(10).join(blocks) or '(none)'}
 
@@ -340,7 +384,10 @@ STEP 2 - write:
 - intro: 20-35 words (~9s). SENTENCE 1: streamer name + the most shocking thing, under 12 words.
   Then only the context needed to understand the clip, then a setup like "Watch what happened."
   Every claim must be visible/audible in the clip or stated in the news. Don't repeat the clip's lines.
-- outro: 8-15 words: one punchy line + a question that makes people comment.
+- outro: 8-15 words: one punchy line + a question that makes people comment. LOOP IT: make the
+  outro's last words flow naturally back into the intro's first sentence, so when the Short
+  replays it sounds continuous (e.g. outro "...and nobody saw what came next when" -> intro
+  "Kai Cenat just got banned..."). Only if it still sounds natural.
 - Pick the format that fits: {formats}
 
 RULES: Never invent quotes/numbers/events/backstory. Rumors = "reportedly". No insults or
@@ -452,6 +499,8 @@ def ass_escape(s):
     return s.replace("{", "(").replace("}", ")").replace("\\", "/")
 
 
+# Slurs get bleeped in the AUDIO (regular swearing stays - it's normal for streamer clips).
+SLURS = re.compile(r"^(n[i1]gg\w*|nigg\w*|fag\w*|f[a4]gg\w*|retard\w*|tr[a4]nn\w*|chinks?|spics?|k[i1]kes?)$", re.I)
 SWEARS = re.compile(r"\b(f+u+c+k\w*|shit\w*|bitch\w*|n[i1]gg\w*|cunt\w*|dick\w*|puss\w*|fag\w*)\b", re.I)
 
 
@@ -590,9 +639,9 @@ def pick_music():
     return (random.choice(local), None) if local else (None, None)
 
 
-def build_video(sections, voice, total, ass, out, music=None, duck=None):
+def build_video(sections, voice, total, ass, out, music=None, duck=None, bleeps=()):
     """sections: [(src, start, length, zoom)] played back to back. duck: (start, end) where the
-    real clip plays - music drops so you can hear it."""
+    real clip plays - music drops so you can hear it. bleeps: [(start, end)] to mute + beep."""
     parts = []
     for k, (src, start, length, zoom) in enumerate(sections):
         p = WORK / f"part{k}.mp4"
@@ -614,6 +663,10 @@ def build_video(sections, voice, total, ass, out, music=None, duck=None):
     for _ in cuts:
         cmd += ["-i", str(whoosh)]
     fc, mix = [], ["[1:a]"]
+    if bleeps:
+        when = "+".join(f"between(t,{a:.2f},{b:.2f})" for a, b in bleeps)
+        fc.append(f"[1:a]volume=0:enable='{when}'[vo]")
+        mix = ["[vo]"]
     for n, c in enumerate(cuts):
         ms = max(0, int((c - 0.2) * 1000))  # whoosh leads into the cut
         fc.append(f"[{n + 2}:a]adelay={ms}|{ms},volume=0.5[w{n}]")
@@ -623,6 +676,11 @@ def build_video(sections, voice, total, ass, out, music=None, duck=None):
         duck_f = f",volume=0.25:enable='between(t,{duck[0]:.2f},{duck[1]:.2f})'" if duck else ""
         fc.append(f"[{len(cuts) + 2}:a]volume=0.13{duck_f},afade=t=out:st={max(0, total - 1.5):.2f}:d=1.5[m]")
         mix.append("[m]")
+    if bleeps:  # classic 1 kHz censor beep exactly over the muted words
+        k = len(cuts) + 2 + (1 if music else 0)
+        cmd += ["-f", "lavfi", "-t", f"{total:.2f}", "-i", "sine=frequency=1000:sample_rate=44100"]
+        fc.append(f"[{k}:a]volume='0.3*({when})':eval=frame,aformat=channel_layouts=stereo[bp]")
+        mix.append("[bp]")
     fc.append(f"{''.join(mix)}amix=inputs={len(mix)}:duration=first:normalize=0[a]")
     fc.append(f"[0:v]ass={ass.name}[v]")
     cmd += ["-filter_complex", ";".join(fc), "-map", "[v]", "-map", "[a]",
@@ -670,8 +728,17 @@ def upload(path, meta):
 def main():
     WORK.mkdir(exist_ok=True)
     history = load_history()
+    # 0. Learn from our own results: refresh view counts of recent Shorts
+    try:
+        update_views(history)
+    except Exception as e:
+        print("view update failed:", e)
+    HISTORY.write_text(json.dumps(history, indent=1))  # keep view counts even if we skip today
+    avg_views, perf = performance(history)
+    print("Performance so far:\n" + perf)
+
     # 1. This week's most-viewed clips from big streamers = moments already going viral
-    candidates = find_trending_clips(history)
+    candidates = find_trending_clips(history, avg_views)
     if not candidates:
         sys.exit("No clips found.")
 
@@ -679,7 +746,7 @@ def main():
     names = list(dict.fromkeys(c["name"] for c in candidates))
     items = sorted(fetch_google_news(names), key=lambda i: i["score"], reverse=True)[:25]
     story = {"news": "\n".join(f"- {i['title']} ({i['url']})" for i in items),
-             "recent": [h.get("topic") for h in history[-30:]]}
+             "recent": [h.get("topic") for h in history[-30:]], "perf": perf}
     print(f"{len(items)} news items for {names}")
 
     # 3. Download, transcribe and grab frames from each candidate
@@ -750,7 +817,7 @@ def main():
     pieces, sections, words, overlays = [(intro_mp3, 0, t1)], split_broll(broll, t1), list(intro_words), []
     credits = ([credit_for(c) for c in [main_clip] + broll_clips if c]
                + (["Stock footage: Pexels"] if stock_used else []))
-    duck = None
+    duck, bleeps = None, []
 
     if main_clip:
         cs = max(0.0, float(meta.get("clip_start") or 0))
@@ -760,7 +827,12 @@ def main():
         t2 = ce - cs
         pieces.append((main_clip["path"], cs, t2))
         sections.append((main_clip["path"], cs, t2, False))
-        words += [(s - cs + t1, e - cs + t1, w) for s, e, w in main_clip["words"] if s >= cs and e <= ce]
+        clip_words = [(s - cs + t1, e - cs + t1, w) for s, e, w in main_clip["words"] if s >= cs and e <= ce]
+        words += clip_words
+        bleeps = [(max(0, s - 0.05), e + 0.05) for s, e, w in clip_words
+                  if SLURS.match(re.sub(r"[^\w]", "", w))]
+        if bleeps:
+            print(f"Bleeping {len(bleeps)} word(s)")
         overlays.append((t1, t1 + t2, "Credit", credit_for(main_clip)))
         if meta.get("clip_label"):
             overlays.append((t1, t1 + t2, "Label", meta["clip_label"].upper()))
@@ -785,12 +857,13 @@ def main():
     ass = WORK / "subs.ass"
     write_ass(words, total, ass, meta.get("hook_text", ""), overlays)
     out = WORK / "final.mp4"
-    build_video(sections, voice, total, ass, out, music, duck)
+    build_video(sections, voice, total, ass, out, music, duck, bleeps)
     print(f"Video: {total:.1f}s")
 
     vid = None if DRY_RUN else upload(out, meta)
     history.append({"date": str(dt.date.today()), "topic": meta["topic"], "title": meta["source"]["title"],
-                    "url": meta["source"]["url"], "video": vid})
+                    "url": meta["source"]["url"], "video": vid, "streamer": main_clip["name"],
+                    "yt_title": meta["title"], "views": None})
     HISTORY.write_text(json.dumps(history, indent=1))
 
 
