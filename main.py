@@ -71,15 +71,35 @@ def load_history():
 
 
 # ---------- 2. Script ----------
-def gemini(prompt):
-    r = requests.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-        headers={"x-goog-api-key": GEMINI_KEY},
-        json={"contents": [{"parts": [{"text": prompt}]}],
-              "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9}},
-        timeout=120)
+GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def gemini_models():
+    """Ask Google which text models this key can use; newest 'flash' first."""
+    r = requests.get(f"{GEMINI_API}/models", headers={"x-goog-api-key": GEMINI_KEY},
+                     params={"pageSize": 200}, timeout=30)
     r.raise_for_status()
-    return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+    skip = ("image", "tts", "audio", "live", "embedding", "vision", "thinking", "learnlm", "gemma")
+    names = [m["name"] for m in r.json().get("models", [])
+             if "generateContent" in m.get("supportedGenerationMethods", [])
+             and "gemini" in m["name"] and not any(s in m["name"] for s in skip)]
+    rank = lambda n: ("flash" in n, "lite" not in n, "preview" not in n and "exp" not in n, n)
+    return sorted(names, key=rank, reverse=True)
+
+
+def gemini(prompt):
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9}}
+    models = gemini_models()
+    print("Gemini models available:", models[:5])
+    for model in models[:6]:
+        r = requests.post(f"{GEMINI_API}/{model}:generateContent",
+                          headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=120)
+        if r.ok:
+            print("Using", model)
+            return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+        print(f"{model} failed: {r.status_code} {r.text[:200]}")
+    sys.exit("No Gemini model worked - check GEMINI_API_KEY.")
 
 
 def write_script(items, history):
