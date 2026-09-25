@@ -55,16 +55,16 @@ HOOK_WORDS = ["banned", "record", "drama", "arrested", "leaves", "quits", "milli
               "apologizes", "reacts", "exposed", "breaks", "subathon", "signs", "returns", "fight",
               "heated", "confronts", "calls out", "responds"]
 # Names that also mean other things (Ninja blenders, BBC's "Ludwig", ...) need a streaming word nearby.
-AMBIGUOUS = {"ninja", "ludwig", "sketch", "lacy", "shroud", "clix", "ibai", "fanum", "kick streamer"}
+AMBIGUOUS = {"ninja", "ludwig", "sketch", "lacy", "shroud", "clix", "ibai", "fanum", "kick streamer",
+             "marlon", "silky", "cuffem", "kishka", "emiru", "tfue", "agent 00", "fanum"}
 STREAM_WORDS = ["stream", "twitch", "kick", "youtuber", "subathon", "clip", "creator", "influencer", "chat"]
 JUNK_WORDS = ["air fryer", "blender", "knife", "deal", "sale", "% off", "review:", "prime day",
               "appliance", "vacuum", "cookware", "stock price", "earnings", "net worth", "who is"]
 
 
-def fetch_google_news():
-    queries = [(q, None) for q in ["twitch streamer banned", "streamer drama", "streamer record",
-                                    "kick streamer", "twitch subathon", "streamer heated"]]
-    queries += [(f'"{n}" streamer', n.lower()) for n in random.sample(BIG_STREAMERS, 14)]
+def fetch_google_news(names):
+    """Last-2-days headlines about these streamers (context for their clips)."""
+    queries = [(f'"{n}"', n.lower()) for n in names]
     items, seen = [], set()
     for q, name in queries:
         try:
@@ -155,45 +155,11 @@ def gemini(prompt, temperature=0.9, images=()):
     sys.exit("Gemini unavailable after ~20 minutes - it will try again at the next run.")
 
 
-def pick_story(items, history):
-    used = {h["url"] for h in history} | {h["title"].lower() for h in history}
-    fresh = [i for i in items if i["url"] not in used and i["title"].lower() not in used]
-    fresh.sort(key=lambda i: i["score"], reverse=True)
-    if not fresh:
-        sys.exit("No fresh sources today.")
-    recent = [h["topic"] for h in history[-30:]]
-    sources = "\n".join(f"[{n}] {i['title']} | {i['text']} | {i['url']}"
-                        for n, i in enumerate(fresh[:45]))
-    prompt = f"""You run a streamer-news Shorts channel whose videos get millions of views.
-Pick the ONE story below that the most people will stop scrolling for.
-
-HOW TO PICK (in this order):
-1. A famous streamer most teens/young adults know (Kai Cenat, IShowSpeed, xQc, Adin Ross, etc).
-   Unknown/small streamers = reject.
-2. Something that HAPPENED ON STREAM or on camera (a confrontation, reaction, rant, ban moment,
-   record, collab, crazy moment) is best, because we will show the real clip. Pure business news
-   is worse. Boring = reject (earnings, esports rosters, hardware, listicles, profiles, net worth).
-3. Fresh: last 24-48h, several outlets cover it.
-4. NOT a repeat of these recent topics: {recent}
-
-Return JSON: {{"source_index": int, "viral_score": int 1-10, "topic": "short topic label",
-"streamers": [{{"name": "N3on", "twitch": "twitch username or null", "kick": "kick username or null"}}]
-   (main streamer first; most big streamers use the same username as their name without spaces,
-    e.g. Kai Cenat -> twitch "kaicenat"; N3on and Adin Ross stream on Kick -> kick "n3on", "adinross"),
-"moment_keywords": [4-8 words/names likely said or shown in the clip of this moment]}}
-
-SOURCES:
-{sources}"""
-    data = gemini(prompt, temperature=0.4)
-    data["source"] = fresh[data["source_index"]]
-    return data
-
-
 # ---------- 3. Clips ----------
 def list_twitch(user):
     clips = []
-    for rng in ("7d", "30d"):
-        r = subprocess.run([sys.executable, "-m", "yt_dlp", "--flat-playlist", "--playlist-end", "15", "--print",
+    for rng in ("7d",):
+        r = subprocess.run([sys.executable, "-m", "yt_dlp", "--flat-playlist", "--playlist-end", "6", "--print",
                             "%(title)s\t%(duration)s\t%(view_count)s\t%(url)s",
                             f"https://www.twitch.tv/{user}/clips?filter=clips&range={rng}"],
                            capture_output=True, text=True, timeout=180)
@@ -212,10 +178,10 @@ def list_kick(user):
     clips = []
     try:
         from curl_cffi import requests as cffi  # gets past Kick's Cloudflare
-        for rng in ("week", "month"):
+        for rng in ("week",):
             r = cffi.get(f"https://kick.com/api/v2/channels/{user}/clips", impersonate="chrome",
                          params={"cursor": 0, "sort": "view", "time": rng}, timeout=30)
-            for c in r.json().get("clips", [])[:15]:
+            for c in r.json().get("clips", [])[:6]:
                 url = c.get("video_url") or c.get("clip_url")
                 if url:
                     clips.append({"title": c.get("title") or "", "duration": float(c.get("duration") or 0),
@@ -228,18 +194,46 @@ def list_kick(user):
     return clips
 
 
-def find_clips(streamers):
-    found, seen = [], set()
-    for s in streamers[:3]:
-        for plat, lister in (("twitch", list_twitch), ("kick", list_kick)):
-            user = (s.get(plat) or "").lower().strip()
-            if user and user != "null":
-                for c in lister(user):
-                    if c["url"] not in seen and 3 <= c["duration"] <= 120:
-                        seen.add(c["url"])
-                        found.append(c)
-        print(f"{s.get('name')}: {sum(c['user'] in (s.get('twitch'), s.get('kick')) for c in found)} clips")
-    return found
+# name -> (twitch username, kick username). Wrong/missing usernames are just skipped.
+STREAMER_ACCOUNTS = {
+    "Kai Cenat": ("kaicenat", None), "xQc": ("xqc", "xqc"), "Adin Ross": (None, "adinross"),
+    "N3on": (None, "n3on"), "Pokimane": ("pokimane", None), "Hasan Piker": ("hasanabi", None),
+    "Asmongold": ("zackrawrr", None), "Jynxzi": ("jynxzi", None), "Duke Dennis": ("dukedennis", None),
+    "Fanum": ("fanum", None), "Agent 00": ("agent00", None), "Caseoh": ("caseoh_", None),
+    "Shroud": ("shroud", None), "Summit1g": ("summit1g", None), "Amouranth": ("amouranth", "amouranth"),
+    "Sneako": (None, "sneako"), "Clix": ("clix", None), "Plaqueboymax": ("plaqueboymax", None),
+    "Stable Ronaldo": ("stableronaldo", None), "Lacy": ("lacy", None), "Emiru": ("emiru", None),
+    "Mizkif": ("mizkif", None), "Moistcr1tikal": ("moistcr1tikal", None), "Tyler1": ("loltyler1", None),
+    "Silky": ("silky", None), "Jason The Ween": ("jasontheween", None), "ExtraEmily": ("extraemily", None),
+    "Marlon": ("marlon", None), "Sketch": ("sketch", None), "Ninja": ("ninja", None),
+    "Ibai": ("ibai", None), "Tfue": ("tfue", "tfue"), "Zherka": (None, "zherka"),
+    "Cuffem": (None, "cuffem"), "Kishka": (None, "kishka"), "iShowSpeed": (None, "ishowspeed"),
+}
+
+
+def find_trending_clips(history, n_streamers=18, keep=8):
+    """This week's most-viewed clips from a random set of big streamers -> best `keep` candidates
+    (max 2 per streamer, never a clip we already used)."""
+    used = {h.get("clip") for h in history} | {h.get("url") for h in history}
+    names = random.sample(list(STREAMER_ACCOUNTS), min(n_streamers, len(STREAMER_ACCOUNTS)))
+    pool = []
+    for name in names:
+        tw, kk = STREAMER_ACCOUNTS[name]
+        got = (list_twitch(tw) if tw else []) + (list_kick(kk) if kk else [])
+        got = [c for c in got if c["url"] not in used and 8 <= c["duration"] <= 90]
+        for c in got:
+            c["name"] = name
+        print(f"{name}: {len(got)} clips, top views {max([c['views'] for c in got], default=0)}")
+        pool += got
+    pool.sort(key=lambda c: c["views"], reverse=True)
+    picked, per = [], {}
+    for c in pool:
+        if per.get(c["name"], 0) < 2:
+            picked.append(c)
+            per[c["name"]] = per.get(c["name"], 0) + 1
+        if len(picked) >= keep:
+            break
+    return picked
 
 
 def download_clip(c, path):
@@ -304,31 +298,8 @@ def as_timestamped_text(words):
     return "\n".join(out)
 
 
-def pick_candidates(story, clips, n=6):
-    """Ask Gemini which clips (by title) most likely show the moment; then add top-viewed ones."""
-    if not clips:
-        return []
-    listing = "\n".join(f"[{i}] {c['platform']}/{c['user']} | {c['views']} views | {c['duration']:.0f}s | "
-                        f"last {c['range']} | {c['title']}" for i, c in enumerate(clips))
-    data = gemini(f"""A Short is about this story: {story['source']['title']} | {story['source']['text']}
-Keywords of the moment: {story.get('moment_keywords')}
-Which of these clips most likely SHOW this exact moment? Clip titles are often vague; use keywords,
-recency (last 7d beats 30d), and views. Return JSON {{"picks": [up to {n} indices, best first]}}.
-
-CLIPS:
-{listing}""", temperature=0.2)
-    picks = [clips[i] for i in data.get("picks", []) if isinstance(i, int) and 0 <= i < len(clips)]
-    main_user = {story["streamers"][0].get("twitch"), story["streamers"][0].get("kick")}
-    for c in sorted(clips, key=lambda c: c["views"], reverse=True):  # fill with popular main-streamer clips
-        if len(picks) >= n:
-            break
-        if c not in picks and c["user"] in main_user:
-            picks.append(c)
-    return picks[:n]
-
-
 # ---------- 4. Script ----------
-def write_script(story, clips, feedback=None, no_clip=False):
+def write_script(story, clips, feedback=None, rejected=None):
     blocks, images = [], []
     for i, c in enumerate(clips):
         seen = "no image"
@@ -338,43 +309,46 @@ def write_script(story, clips, feedback=None, no_clip=False):
         blocks.append(f"CLIP [{i}] {c['platform']}/{c['user']} \"{c['title']}\" ({c['duration']:.0f}s) - {seen}\n"
                       + (as_timestamped_text(c["words"]) if c["words"] else "(no speech)"))
     formats = "\n".join(f"  - {f}" for f in FORMATS)
-    prompt = f"""You write viral YouTube Shorts about streamers. The Short = [narrated intro] + [the REAL
-clip playing with its original audio] + [narrated outro].
+    prompt = f"""You run a streamer clip channel (like the big LivestreamFail-style Shorts channels) whose
+videos get millions of views. The Short = [narrated intro] + [the REAL clip playing with its
+original audio] + [narrated outro].
 
-STORY: {story['source']['title']} | {story['source']['text']}
+Below are this week's MOST-VIEWED clips from famous streamers (already going viral), transcribed,
+with frames attached (IMAGE #1, #2, ... in the order listed).
 
-TRANSCRIBED CLIPS of the streamer(s) (timestamps in seconds):
+RECENT NEWS about these streamers (context only - use it if it explains a clip):
+{story['news'] or '(none)'}
+
+Topics we already covered recently (don't repeat): {story['recent']}
+
+CLIPS (timestamps in seconds):
 {chr(10).join(blocks) or '(none)'}
 
-The attached images are frames from the clips (IMAGE #1, #2, ... in the order listed). USE THEM:
-a clip is only RELEVANT if what you SEE and HEAR fits the story - e.g. the people/place/event in
-the story, or the streamer on face cam / IRL talking about it. Plain gameplay (Fortnite, GTA,
-Minecraft...), other people, or unrelated streams are NOT relevant, even if it's the right streamer.
-
-STEP 1 - choose the clip:
-- clip_index = the RELEVANT clip that actually shows THIS story's moment, or the streamer on camera
-  talking/reacting about it. If none clearly relates, you may pick a clip of the MAIN streamer on
-  camera (face visible, not gameplay) with intense/funny lines and set "clip_relates": false.
-  If there is no such clip, clip_index = -1.
-- clip_start/clip_end: 8-18 seconds, cut at sentence boundaries using the timestamps, containing
-  the strongest lines. Don't start mid-sentence.
+STEP 1 - pick the ONE clip most likely to go viral as a Short:
+- A real MOMENT: confrontation, heated argument, shocking/funny reaction, crazy IRL event, big
+  announcement, emotional moment, a famous guest. Face cam / IRL where you can SEE it happen.
+- The speech must be understandable and make sense with a short intro. It must be clear WHO is
+  talking. Look at the frames AND read the transcript to understand what really happens.
+- REJECT: plain gameplay, chatting about nothing, music/dancing without a story, clips where the
+  transcript is gibberish, anything you can't clearly explain, and repeats of covered topics.
+- clip_start/clip_end: 8-18 seconds containing the best part, cut at sentence boundaries using the
+  timestamps. Don't start mid-sentence; don't cut off the punchline.
+- If the news explains the clip, set clip_relates true and use it. If there's no news, describe
+  ONLY what the clip shows - never guess the backstory.
 
 STEP 2 - write:
-- intro: 25-40 words (~10s). SENTENCE 1: streamer name + the most shocking fact, under 12 words
-  (e.g. "N3on just got into it with a UFC fighter... on camera."). Then the context needed to
-  understand the clip. If clip_relates is true, end with a setup like "Listen to what he said."
-  If clip_relates is false, do NOT claim the clip shows the story; end with e.g. "And this is how
-  he's acting on stream." Don't repeat the clip's lines.
+- intro: 20-35 words (~9s). SENTENCE 1: streamer name + the most shocking thing, under 12 words.
+  Then only the context needed to understand the clip, then a setup like "Watch what happened."
+  Every claim must be visible/audible in the clip or stated in the news. Don't repeat the clip's lines.
 - outro: 8-15 words: one punchy line + a question that makes people comment.
-- If clip_index is -1: intro = full 60-80 word script instead, outro = "".
 - Pick the format that fits: {formats}
 
-RULES: facts ONLY from the story and transcripts. Never invent quotes/numbers/events. Rumors =
-"reportedly". No insults or unproven accusations. No emojis/hashtags/stage directions in speech.
+RULES: Never invent quotes/numbers/events/backstory. Rumors = "reportedly". No insults or
+unproven accusations. No emojis/hashtags/stage directions in speech. Only if EVERY clip is
+unusable: clip_index = -1 and intro = a 60-80 word script about the best news story instead.
 
-- broll: indices of OTHER clips that are also relevant and fine to show silently behind the
-  narration (streamer's face/IRL, the people or event in the story). Exclude gameplay-only and
-  unrelated clips. [] is fine - we'd rather reuse the main clip than show something off-topic.
+- broll: indices of OTHER clips of the SAME moment/event (e.g. another angle of the same fight)
+  to show silently behind the narration. Almost always []: we reuse other seconds of the main clip.
 
 Return JSON: {{"clip_index": int, "clip_relates": bool, "clip_start": float, "clip_end": float,
 "broll": [int],
@@ -388,9 +362,8 @@ Return JSON: {{"clip_index": int, "clip_relates": bool, "clip_start": float, "cl
         prompt += ("\n\nA FACT-CHECKER REJECTED YOUR LAST ATTEMPT. Fix every problem (pick a different "
                    "clip or seconds, or reword the intro so it only promises what the clip really shows):\n"
                    + "\n".join(f"- {p}" for p in feedback))
-    if no_clip:
-        prompt += ("\n\nNO CLIP PASSED THE FACT-CHECK. Set clip_index = -1 (narration only) and write the "
-                   "full 60-80 word script as the intro. You may still list relevant broll clips.")
+    if rejected:
+        prompt += (f"\n\nCLIPS ALREADY REJECTED BY THE FACT-CHECKER: {rejected}. Pick a DIFFERENT clip.")
     return gemini(prompt, temperature=0.7, images=images)
 
 
@@ -404,8 +377,9 @@ def verify(story, meta, clip, attempt):
     sheet = contact_sheet(clip, f"verify{attempt}", times=(cs + 0.5, (cs + ce) / 2, ce - 0.5))
     data = gemini(f"""You are a strict fact-checker for a streamer-news YouTube Short. Be skeptical.
 
-NEWS STORY: {story['source']['title']} | {story['source']['text']}
-STREAMERS IN THE STORY: {[s.get('name') for s in story['streamers']]}
+RECENT NEWS (the only allowed source besides the clip itself): {story['news'] or '(none)'}
+THE CLIP IS FROM: {clip['name']}'s channel. Full transcript of the clip:
+{as_timestamped_text(clip['words']) if clip['words'] else '(no speech)'}
 
 THE VIDEO:
 1. Narrator intro: "{meta.get('intro')}"
@@ -423,8 +397,10 @@ a) Does the clip part actually deliver what the intro promises? If the intro say
    really be X's response about Y / that event - not a random moment, not a different topic.
 b) Is the person speaking/shown plausibly the streamer the video claims? (channel, frames, words)
 c) Does the part start and end cleanly (not mid-sentence, the key line isn't cut off)?
-d) Are all facts in intro/outro/title/label supported by the news story or the transcript?
-   Any invented quote, number or event = fail.
+d) Are all facts in intro/outro/title/label supported by the news or the clip (transcript+frames)?
+   Any invented quote, number, event or backstory = fail.
+f) Is this actually worth watching - a clear, interesting moment a viewer understands in 3 seconds?
+   Boring/confusing/gameplay-only = fail.
 e) Nothing misleading: the label and title must not claim more than the clip shows.
 
 Return JSON: {{"pass": bool, "problems": ["specific problem + how to fix it"]}}""",
@@ -677,7 +653,7 @@ def upload(path, meta):
     hashtags = " ".join(dict.fromkeys(["#shorts", "#viral", "#streamer", "#twitch", "#fyp"] +
                                       [t.replace(" ", "") for t in tags]))
     credits = "\n".join(dict.fromkeys(meta.get("credits", []))) or "Footage: Pexels"
-    desc = (f"{meta['description']}\n\nCredits:\n{credits}\nNews source: {meta['source']['url']}\n\n"
+    desc = (f"{meta['description']}\n\nCredits:\n{credits}\nOriginal clip: {meta['source']['url']}\n\n"
             f"All clips belong to their respective creators.\n\n{hashtags}")
     body = {"snippet": {"title": meta["title"][:100],
                         "description": desc[:4900],
@@ -694,16 +670,21 @@ def upload(path, meta):
 def main():
     WORK.mkdir(exist_ok=True)
     history = load_history()
-    items = fetch_google_news()
-    print(f"{len(items)} news items")
-    story = pick_story(items, history)
-    print(f"Story: {story['source']['title']}  (viral {story.get('viral_score')}/10)")
-    print("Streamers:", story["streamers"])
+    # 1. This week's most-viewed clips from big streamers = moments already going viral
+    candidates = find_trending_clips(history)
+    if not candidates:
+        sys.exit("No clips found.")
 
-    # Find + download + transcribe the clips most likely to show the moment
-    all_clips = find_clips(story["streamers"])
+    # 2. News about those streamers, only as context for what's happening in the clips
+    names = list(dict.fromkeys(c["name"] for c in candidates))
+    items = sorted(fetch_google_news(names), key=lambda i: i["score"], reverse=True)[:25]
+    story = {"news": "\n".join(f"- {i['title']} ({i['url']})" for i in items),
+             "recent": [h.get("topic") for h in history[-30:]]}
+    print(f"{len(items)} news items for {names}")
+
+    # 3. Download, transcribe and grab frames from each candidate
     clips = []
-    for c in pick_candidates(story, all_clips):
+    for c in candidates:
         p = WORK / f"clip{len(clips)}.mp4"
         if download_clip(c, p):
             c["path"] = p
@@ -716,21 +697,30 @@ def main():
             clips.append(c)
     print(f"{len(clips)} clips ready")
 
-    # Write -> fact-check -> rewrite (up to 3 tries). If no clip passes, go narration-only.
-    feedback = None
+    # 4. Pick + write -> fact-check -> fix (up to 4 tries). Nothing passes = no video today:
+    #    better to skip a day than post something bad.
+    feedback, rejected, passed = None, [], False
     for attempt in range(4):
-        meta = write_script(story, clips, feedback, no_clip=attempt == 3)
+        meta = write_script(story, clips, feedback, rejected)
         idx = meta.get("clip_index", -1)
         main_clip = clips[idx] if isinstance(idx, int) and 0 <= idx < len(clips) else None
-        if not main_clip or attempt == 3:  # final try is always narration-only
-            main_clip = None
+        if not main_clip:
+            print("Gemini found no usable clip.")
             break
+        print(f"Try #{attempt + 1}: {main_clip['name']} - {main_clip['url']} "
+              f"{meta.get('clip_start')}-{meta.get('clip_end')}s\n  Intro: {meta.get('intro')}")
         passed, problems = verify(story, meta, main_clip, attempt)
         print(f"Fact-check #{attempt + 1}: {'PASSED' if passed else 'FAILED'}", *problems, sep="\n  ")
         if passed:
             break
         feedback = problems
-    meta.update(source=story["source"], topic=story["topic"])
+        if attempt >= 1:  # same clip failed twice -> move on to another clip
+            rejected.append(idx)
+            feedback = None
+    if not passed:
+        sys.exit("No clip passed the fact-check today - skipping instead of posting a bad video.")
+    meta.update(source={"title": main_clip["title"], "url": main_clip["url"]},
+                topic=f"{main_clip['name']}: {meta.get('clip_label') or meta['title']}")
     print("Title:", meta["title"])
     print("Intro:", meta["intro"])
     print("Clip:", main_clip and f"{main_clip['url']} {meta.get('clip_start')}-{meta.get('clip_end')}s "
