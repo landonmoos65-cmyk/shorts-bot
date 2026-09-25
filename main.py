@@ -10,6 +10,7 @@ import os
 import random
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -91,15 +92,33 @@ def gemini(prompt):
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9}}
     models = gemini_models()
-    print("Gemini models available:", models[:5])
-    for model in models[:6]:
-        r = requests.post(f"{GEMINI_API}/{model}:generateContent",
-                          headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=120)
-        if r.ok:
-            print("Using", model)
-            return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
-        print(f"{model} failed: {r.status_code} {r.text[:200]}")
-    sys.exit("No Gemini model worked - check GEMINI_API_KEY.")
+    print("Gemini models available:", models[:8])
+    dead = set()  # models with no free quota (429) - don't retry those
+    # Google often returns 503 "high demand" for a few minutes; keep retrying for ~20 min.
+    for attempt, wait in enumerate([0, 30, 60, 120, 180, 300, 300, 300]):
+        if wait:
+            print(f"All models busy - waiting {wait}s (attempt {attempt + 1})")
+            time.sleep(wait)
+        for model in models:
+            if model in dead:
+                continue
+            try:
+                r = requests.post(f"{GEMINI_API}/{model}:generateContent",
+                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=120)
+            except requests.RequestException as e:
+                print(f"{model} error: {e}")
+                continue
+            if r.ok:
+                try:
+                    print("Using", model)
+                    return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+                except (KeyError, IndexError, ValueError) as e:
+                    print(f"{model} bad response: {e}")
+                    continue
+            print(f"{model} failed: {r.status_code}")
+            if r.status_code in (400, 403, 404, 429):
+                dead.add(model)
+    sys.exit("Gemini unavailable after ~20 minutes - it will try again at the next run.")
 
 
 def write_script(items, history):
