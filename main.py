@@ -1,13 +1,18 @@
 """Daily streamer-news YouTube Shorts bot.
 
-Pipeline: real news sources -> Gemini script -> Edge TTS voice -> Pexels
-background -> FFmpeg with burned-in captions -> YouTube upload.
+Pipeline:
+  Google News -> Gemini picks the most viral story
+  -> finds that streamer's Twitch/Kick clips -> transcribes them (Whisper)
+  -> Gemini picks the clip + exact seconds that show the moment and writes intro/outro
+  -> [narrated intro] + [the REAL clip with its own audio + captions] + [narrated outro]
+  -> FFmpeg (captions, zooms, whooshes, music) -> YouTube upload.
 """
 import asyncio
 import datetime as dt
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -23,36 +28,20 @@ HISTORY = ROOT / "history.json"
 UA = {"User-Agent": "Mozilla/5.0 (shorts-bot)"}
 
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-PEXELS_KEY = os.environ["PEXELS_API_KEY"]
+PEXELS_KEY = os.environ.get("PEXELS_API_KEY", "")
 VOICE = os.environ.get("TTS_VOICE", "en-US-AndrewNeural")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small.en")
 DRY_RUN = os.environ.get("DRY_RUN") == "1"  # build video but skip upload
 
 FORMATS = [
     "breaking news recap: what happened, why it matters",
-    "'things you didn't know' about the streamer(s) involved, using only facts in the sources",
-    "records, numbers and stats angle",
     "drama recap told like a story with a twist at the end",
-    "rise-to-fame angle: how the streamer got here",
+    "records, numbers and stats angle",
+    "'things you didn't know' about the streamer(s) involved, using only facts in the sources",
 ]
 
 
-# ---------- 1. Sources ----------
-def fetch_reddit():
-    items = []
-    for sub in ("LivestreamFail", "Twitch", "KickStreaming"):
-        try:
-            r = requests.get(f"https://www.reddit.com/r/{sub}/top.json?t=day&limit=15",
-                             headers=UA, timeout=15)
-            r.raise_for_status()
-            for c in r.json()["data"]["children"]:
-                d = c["data"]
-                items.append({"title": d["title"], "url": "https://reddit.com" + d["permalink"],
-                              "text": d.get("selftext", "")[:800], "score": d.get("score", 0)})
-        except Exception as e:
-            print(f"reddit {sub} failed: {e}")
-    return items
-
-
+# ---------- 1. News ----------
 # The names people actually search for. Stories about them get far more views.
 BIG_STREAMERS = [
     "Kai Cenat", "IShowSpeed", "xQc", "Adin Ross", "Pokimane", "Ninja", "MrBeast", "Dr Disrespect",
@@ -62,17 +51,18 @@ BIG_STREAMERS = [
     "Moistcr1tikal", "Tyler1", "Sykkuno", "Faze Banks", "Jake Paul", "Kick streamer",
 ]
 HOOK_WORDS = ["banned", "record", "drama", "arrested", "leaves", "quits", "million", "lawsuit",
-              "apologizes", "reacts", "exposed", "breaks", "subathon", "signs", "returns", "fight"]
+              "apologizes", "reacts", "exposed", "breaks", "subathon", "signs", "returns", "fight",
+              "heated", "confronts", "calls out", "responds"]
 # Names that also mean other things (Ninja blenders, BBC's "Ludwig", ...) need a streaming word nearby.
 AMBIGUOUS = {"ninja", "ludwig", "sketch", "lacy", "shroud", "clix", "ibai", "fanum", "kick streamer"}
 STREAM_WORDS = ["stream", "twitch", "kick", "youtuber", "subathon", "clip", "creator", "influencer", "chat"]
 JUNK_WORDS = ["air fryer", "blender", "knife", "deal", "sale", "% off", "review:", "prime day",
-              "appliance", "vacuum", "cookware", "stock price", "earnings"]
+              "appliance", "vacuum", "cookware", "stock price", "earnings", "net worth", "who is"]
 
 
 def fetch_google_news():
     queries = [(q, None) for q in ["twitch streamer banned", "streamer drama", "streamer record",
-                                    "kick streamer", "twitch subathon", "streamer million deal"]]
+                                    "kick streamer", "twitch subathon", "streamer heated"]]
     queries += [(f'"{n}" streamer', n.lower()) for n in random.sample(BIG_STREAMERS, 14)]
     items, seen = [], set()
     for q, name in queries:
@@ -87,7 +77,7 @@ def fetch_google_news():
                 if name and (name not in low or
                              (name in AMBIGUOUS and not any(w in low for w in STREAM_WORDS))):
                     continue
-                seen.add(title.lower())
+                seen.add(low)
                 items.append({"title": title, "url": it.findtext("link"),
                               "text": f"({it.findtext('pubDate')}) " + (it.findtext("description") or "")[:600],
                               "score": 0})
@@ -107,28 +97,32 @@ def load_history():
     return json.loads(HISTORY.read_text()) if HISTORY.exists() else []
 
 
-# ---------- 2. Script ----------
+# ---------- 2. Gemini ----------
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
+_models = None
 
 
 def gemini_models():
     """Ask Google which text models this key can use; newest 'flash' first."""
-    r = requests.get(f"{GEMINI_API}/models", headers={"x-goog-api-key": GEMINI_KEY},
-                     params={"pageSize": 200}, timeout=30)
-    r.raise_for_status()
-    skip = ("image", "tts", "audio", "live", "embedding", "vision", "thinking", "learnlm", "gemma")
-    names = [m["name"] for m in r.json().get("models", [])
-             if "generateContent" in m.get("supportedGenerationMethods", [])
-             and "gemini" in m["name"] and not any(s in m["name"] for s in skip)]
-    rank = lambda n: ("flash" in n, "lite" not in n, "preview" not in n and "exp" not in n, n)
-    return sorted(names, key=rank, reverse=True)
+    global _models
+    if _models is None:
+        r = requests.get(f"{GEMINI_API}/models", headers={"x-goog-api-key": GEMINI_KEY},
+                         params={"pageSize": 200}, timeout=30)
+        r.raise_for_status()
+        skip = ("image", "tts", "audio", "live", "embedding", "vision", "thinking", "learnlm", "gemma")
+        names = [m["name"] for m in r.json().get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])
+                 and "gemini" in m["name"] and not any(s in m["name"] for s in skip)]
+        rank = lambda n: ("flash" in n, "lite" not in n, "preview" not in n and "exp" not in n, n)
+        _models = sorted(names, key=rank, reverse=True)
+        print("Gemini models available:", _models[:8])
+    return _models
 
 
-def gemini(prompt):
+def gemini(prompt, temperature=0.9):
     body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9}}
+            "generationConfig": {"responseMimeType": "application/json", "temperature": temperature}}
     models = gemini_models()
-    print("Gemini models available:", models[:8])
     dead = set()  # models with no free quota (429) - don't retry those
     # Google often returns 503 "high demand" for a few minutes; keep retrying for ~20 min.
     for attempt, wait in enumerate([0, 30, 60, 120, 180, 300, 300, 300]):
@@ -140,13 +134,12 @@ def gemini(prompt):
                 continue
             try:
                 r = requests.post(f"{GEMINI_API}/{model}:generateContent",
-                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=120)
+                                  headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=180)
             except requests.RequestException as e:
                 print(f"{model} error: {e}")
                 continue
             if r.ok:
                 try:
-                    print("Using", model)
                     return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
                 except (KeyError, IndexError, ValueError) as e:
                     print(f"{model} bad response: {e}")
@@ -157,7 +150,7 @@ def gemini(prompt):
     sys.exit("Gemini unavailable after ~20 minutes - it will try again at the next run.")
 
 
-def write_script(items, history):
+def pick_story(items, history):
     used = {h["url"] for h in history} | {h["title"].lower() for h in history}
     fresh = [i for i in items if i["url"] not in used and i["title"].lower() not in used]
     fresh.sort(key=lambda i: i["score"], reverse=True)
@@ -166,49 +159,197 @@ def write_script(items, history):
     recent = [h["topic"] for h in history[-30:]]
     sources = "\n".join(f"[{n}] {i['title']} | {i['text']} | {i['url']}"
                         for n, i in enumerate(fresh[:45]))
-    formats = "\n".join(f"  - {f}" for f in FORMATS)
     prompt = f"""You run a streamer-news Shorts channel whose videos get millions of views.
-Your #1 job: pick the ONE story below that the most people will stop scrolling for.
+Pick the ONE story below that the most people will stop scrolling for.
 
 HOW TO PICK (in this order):
 1. A famous streamer most teens/young adults know (Kai Cenat, IShowSpeed, xQc, Adin Ross, etc).
    Unknown/small streamers = reject.
-2. High-emotion event: ban, drama, beef, arrest, lawsuit, huge money, broken record, quitting,
-   shocking moment, massive collab, platform switch. Boring = reject (earnings reports, esports
-   roster changes, hardware, "top 10" listicles, local news, game updates).
-3. Fresh: happened in the last 24-48h and people are talking about it (several outlets cover it).
+2. Something that HAPPENED ON STREAM or on camera (a confrontation, reaction, rant, ban moment,
+   record, collab, crazy moment) is best, because we will show the real clip. Pure business news
+   is worse. Boring = reject (earnings, esports rosters, hardware, listicles, profiles, net worth).
+3. Fresh: last 24-48h, several outlets cover it.
 4. NOT a repeat of these recent topics: {recent}
 
-STRICT RULES:
-- Use ONLY facts stated in the sources. Never invent quotes, numbers, or events.
-- If something is a rumor, say "reportedly". No insults or unproven accusations.
-- Pick whichever format fits the story best:
-{formats}
-- Script: 70-90 words (~28 seconds spoken). Short punchy sentences. No emojis/hashtags/stage directions.
-  SENTENCE 1 IS EVERYTHING: name the streamer + the most shocking fact in under 12 words.
-  Good hooks: "Kai Cenat just got banned... for the fourth time." / "IShowSpeed just broke
-  a record nobody thought was possible." / "xQc lost $2 million in one night."
-  Build tension in the middle (open a question, answer it late). No filler like "hey guys" or
-  "in today's video". End with a punchy question that makes people comment.
-- Title: under 60 chars, names the streamer, creates curiosity, not a lie. Add " #shorts".
-- viral_score: honest 1-10 of how viral this story is.
-
-Return JSON: {{"source_index": int, "viral_score": int, "topic": "short topic label",
-"title": str, "script": str, "description": str (2 sentences, no links),
-"hook_text": "max 5 words shown big on screen at the start",
-"streamers": [Twitch usernames of the streamers in the story, lowercase, e.g. "kaicenat"],
-"hashtags": [4 topic hashtags like "#kaicenat"],
-"tags": [10 strings], "search_terms": [4 short stock-footage queries like "gaming setup neon"]}}
+Return JSON: {{"source_index": int, "viral_score": int 1-10, "topic": "short topic label",
+"streamers": [{{"name": "N3on", "twitch": "twitch username or null", "kick": "kick username or null"}}]
+   (main streamer first; most big streamers use the same username as their name without spaces,
+    e.g. Kai Cenat -> twitch "kaicenat"; N3on and Adin Ross stream on Kick -> kick "n3on", "adinross"),
+"moment_keywords": [4-8 words/names likely said or shown in the clip of this moment]}}
 
 SOURCES:
 {sources}"""
-    data = gemini(prompt)
+    data = gemini(prompt, temperature=0.4)
     data["source"] = fresh[data["source_index"]]
     return data
 
 
-# ---------- 3. Voice + captions ----------
-async def tts(text, mp3):
+# ---------- 3. Clips ----------
+def list_twitch(user):
+    clips = []
+    for rng in ("7d", "30d"):
+        r = subprocess.run([sys.executable, "-m", "yt_dlp", "--flat-playlist", "--playlist-end", "15", "--print",
+                            "%(title)s\t%(duration)s\t%(view_count)s\t%(url)s",
+                            f"https://www.twitch.tv/{user}/clips?filter=clips&range={rng}"],
+                           capture_output=True, text=True, timeout=180)
+        for line in r.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 4 and parts[3].startswith("http"):
+                clips.append({"title": parts[0], "duration": float(parts[1] or 0),
+                              "views": int(parts[2] or 0) if parts[2].isdigit() else 0,
+                              "url": parts[3], "platform": "twitch", "user": user, "range": rng})
+        if len(clips) >= 8:
+            break
+    return clips
+
+
+def list_kick(user):
+    clips = []
+    try:
+        from curl_cffi import requests as cffi  # gets past Kick's Cloudflare
+        for rng in ("week", "month"):
+            r = cffi.get(f"https://kick.com/api/v2/channels/{user}/clips", impersonate="chrome",
+                         params={"cursor": 0, "sort": "view", "time": rng}, timeout=30)
+            for c in r.json().get("clips", [])[:15]:
+                url = c.get("video_url") or c.get("clip_url")
+                if url:
+                    clips.append({"title": c.get("title") or "", "duration": float(c.get("duration") or 0),
+                                  "views": int(c.get("view_count") or 0), "url": url,
+                                  "platform": "kick", "user": user, "range": rng})
+            if len(clips) >= 8:
+                break
+    except Exception as e:
+        print(f"kick {user} failed: {e}")
+    return clips
+
+
+def find_clips(streamers):
+    found, seen = [], set()
+    for s in streamers[:3]:
+        for plat, lister in (("twitch", list_twitch), ("kick", list_kick)):
+            user = (s.get(plat) or "").lower().strip()
+            if user and user != "null":
+                for c in lister(user):
+                    if c["url"] not in seen and 3 <= c["duration"] <= 120:
+                        seen.add(c["url"])
+                        found.append(c)
+        print(f"{s.get('name')}: {sum(c['user'] in (s.get('twitch'), s.get('kick')) for c in found)} clips")
+    return found
+
+
+def download_clip(c, path):
+    if c["platform"] == "twitch":
+        r = subprocess.run([sys.executable, "-m", "yt_dlp", "-q", "--no-part", "-f", "b", "-o", str(path), c["url"]], timeout=300)
+    else:  # kick: HLS playlist
+        r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-user_agent", "Mozilla/5.0", "-i", c["url"],
+                            "-c", "copy", str(path)], timeout=300)
+    ok = r.returncode == 0 and path.exists() and path.stat().st_size > 50_000
+    print(("downloaded " if ok else "download failed ") + c["url"])
+    return ok
+
+
+def credit_for(c):
+    return f"Clip: {c['platform']}.{'tv' if c['platform'] == 'twitch' else 'com'}/{c['user']}"
+
+
+_whisper = None
+
+
+def transcribe(path):
+    """-> list of (start, end, word) using faster-whisper."""
+    global _whisper
+    from faster_whisper import WhisperModel
+    if _whisper is None:
+        _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    segs, _ = _whisper.transcribe(str(path), word_timestamps=True, vad_filter=True)
+    return [(w.start, w.end, w.word.strip()) for s in segs for w in (s.words or []) if w.word.strip()]
+
+
+def as_timestamped_text(words):
+    """Compact transcript: a timestamp every ~sentence so Gemini can pick exact cut points."""
+    out, line = [], []
+    for s, e, w in words:
+        if not line:
+            line.append(f"({s:.1f})")
+        line.append(w)
+        if w[-1:] in ".?!" or len(line) > 14:
+            out.append(" ".join(line) + f" ({e:.1f})")
+            line = []
+    if line:
+        out.append(" ".join(line) + f" ({words[-1][1]:.1f})")
+    return "\n".join(out)
+
+
+def pick_candidates(story, clips, n=4):
+    """Ask Gemini which clips (by title) most likely show the moment; then add top-viewed ones."""
+    if not clips:
+        return []
+    listing = "\n".join(f"[{i}] {c['platform']}/{c['user']} | {c['views']} views | {c['duration']:.0f}s | "
+                        f"last {c['range']} | {c['title']}" for i, c in enumerate(clips))
+    data = gemini(f"""A Short is about this story: {story['source']['title']} | {story['source']['text']}
+Keywords of the moment: {story.get('moment_keywords')}
+Which of these clips most likely SHOW this exact moment? Clip titles are often vague; use keywords,
+recency (last 7d beats 30d), and views. Return JSON {{"picks": [up to {n} indices, best first]}}.
+
+CLIPS:
+{listing}""", temperature=0.2)
+    picks = [clips[i] for i in data.get("picks", []) if isinstance(i, int) and 0 <= i < len(clips)]
+    main_user = {story["streamers"][0].get("twitch"), story["streamers"][0].get("kick")}
+    for c in sorted(clips, key=lambda c: c["views"], reverse=True):  # fill with popular main-streamer clips
+        if len(picks) >= n:
+            break
+        if c not in picks and c["user"] in main_user:
+            picks.append(c)
+    return picks[:n]
+
+
+# ---------- 4. Script ----------
+def write_script(story, clips):
+    blocks = []
+    for i, c in enumerate(clips):
+        blocks.append(f"CLIP [{i}] {c['platform']}/{c['user']} \"{c['title']}\" ({c['duration']:.0f}s)\n"
+                      + (as_timestamped_text(c["words"]) if c["words"] else "(no speech)"))
+    formats = "\n".join(f"  - {f}" for f in FORMATS)
+    prompt = f"""You write viral YouTube Shorts about streamers. The Short = [narrated intro] + [the REAL
+clip playing with its original audio] + [narrated outro].
+
+STORY: {story['source']['title']} | {story['source']['text']}
+
+TRANSCRIBED CLIPS of the streamer(s) (timestamps in seconds):
+{chr(10).join(blocks) or '(none)'}
+
+STEP 1 - choose the clip:
+- clip_index = the clip that actually shows THIS story's moment, or the streamer talking/reacting about it.
+  If none clearly relates, pick the clip with the most intense/funny/shocking lines from the MAIN
+  streamer and set "clip_relates": false. If no clip has usable speech, clip_index = -1.
+- clip_start/clip_end: 8-18 seconds, cut at sentence boundaries using the timestamps, containing
+  the strongest lines. Don't start mid-sentence.
+
+STEP 2 - write:
+- intro: 25-40 words (~10s). SENTENCE 1: streamer name + the most shocking fact, under 12 words
+  (e.g. "N3on just got into it with a UFC fighter... on camera."). Then the context needed to
+  understand the clip. If clip_relates is true, end with a setup like "Listen to what he said."
+  If clip_relates is false, do NOT claim the clip shows the story; end with e.g. "And this is how
+  he's acting on stream." Don't repeat the clip's lines.
+- outro: 8-15 words: one punchy line + a question that makes people comment.
+- If clip_index is -1: intro = full 60-80 word script instead, outro = "".
+- Pick the format that fits: {formats}
+
+RULES: facts ONLY from the story and transcripts. Never invent quotes/numbers/events. Rumors =
+"reportedly". No insults or unproven accusations. No emojis/hashtags/stage directions in speech.
+
+Return JSON: {{"clip_index": int, "clip_relates": bool, "clip_start": float, "clip_end": float,
+"intro": str, "outro": str,
+"title": "under 60 chars, names the streamer, curiosity, not a lie, ends with ' #shorts'",
+"description": "2 sentences, no links", "hook_text": "max 5 words shown big at the start",
+"clip_label": "max 4 words shown on top while the clip plays, e.g. 'N3ON vs STRICKLAND'",
+"hashtags": [4 topic hashtags], "tags": [10 strings],
+"search_terms": [3 stock-footage queries, only used if we have no clips]}}"""
+    return gemini(prompt, temperature=0.7)
+
+
+# ---------- 5. Voice + captions ----------
+async def _tts(text, mp3):
     words = []
     comm = edge_tts.Communicate(text, VOICE, rate="+8%", boundary="WordBoundary")
     with open(mp3, "wb") as f:
@@ -221,13 +362,29 @@ async def tts(text, mp3):
     return words
 
 
+def tts(text, mp3):
+    words = asyncio.run(_tts(text, mp3))
+    if not words:  # fallback: spread words evenly
+        toks, d = text.split(), duration(mp3)
+        words = [(i * d / len(toks), (i + 1) * d / len(toks), w) for i, w in enumerate(toks)]
+    return words
+
+
 def duration(path):
     out = subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                                    "-of", "csv=p=0", str(path)])
     return float(out)
 
 
+def is_wide(path):
+    out = subprocess.check_output(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                   "stream=width,height", "-of", "csv=p=0", str(path)]).decode()
+    w, h = [int(x) for x in out.strip().split(",")[:2]]
+    return w > h
+
+
 def ts(s):
+    s = max(0, s)
     return f"{int(s // 3600)}:{int(s % 3600 // 60):02}:{s % 60:05.2f}"
 
 
@@ -235,20 +392,25 @@ def ass_escape(s):
     return s.replace("{", "(").replace("}", ")").replace("\\", "/")
 
 
-def write_ass(words, total, path, hook_text, credits):
-    """credits: list of (start, end, text) shown at the bottom while a clip plays."""
-    if not words:  # fallback: spread evenly
-        toks = WORK.joinpath("script.txt").read_text().split()
-        step = total / len(toks)
-        words = [(i * step, (i + 1) * step, w) for i, w in enumerate(toks)]
+SWEARS = re.compile(r"\b(f+u+c+k\w*|shit\w*|bitch\w*|n[i1]gg\w*|cunt\w*|dick\w*|puss\w*|fag\w*)\b", re.I)
+
+
+def clean(word):
+    """Soften swears in captions (audio stays): 'fuck' -> 'f**k'."""
+    return SWEARS.sub(lambda m: m.group(0)[0] + "*" * (len(m.group(0)) - 2) + m.group(0)[-1], word)
+
+
+def write_ass(words, total, path, hook_text, overlays):
+    """words: absolute (start, end, text). overlays: [(start, end, style, text)]."""
     head = """[Script Info]
 PlayResX: 1080
 PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, BorderStyle, Outline, Shadow, Alignment, MarginV
-Style: Main,DejaVu Sans,96,&H00FFFFFF,&H00000000,&H80000000,1,1,7,3,5,0
+Style: Main,DejaVu Sans,92,&H00FFFFFF,&H00000000,&H80000000,1,1,7,3,5,0
 Style: Hook,DejaVu Sans,84,&H00FFFFFF,&H000000FF,&H00000000,1,3,6,0,8,260
+Style: Label,DejaVu Sans,64,&H00FFFFFF,&H000000FF,&H00000000,1,3,5,0,8,300
 Style: Credit,DejaVu Sans,40,&H00FFFFFF,&H00000000,&H90000000,1,3,4,0,2,230
 
 [Events]
@@ -258,51 +420,24 @@ Format: Layer, Start, End, Style, Text
     if hook_text:  # big red-boxed hook for the first 2.5s
         lines.append(f"Dialogue: 1,{ts(0)},{ts(min(2.5, total))},Hook,"
                      f"{{\\fad(0,200)\\fscx60\\fscy60\\t(0,150,\\fscx100\\fscy100)}}{ass_escape(hook_text.upper())}")
-    for s, e, text in credits:
-        lines.append(f"Dialogue: 1,{ts(s)},{ts(e)},Credit,{ass_escape(text)}")
+    for s, e, style, text in overlays:
+        lines.append(f"Dialogue: 1,{ts(s)},{ts(e)},{style},{ass_escape(text)}")
     for i in range(0, len(words), 2):  # 2 words per caption
         grp = words[i:i + 2]
-        end = words[i + 2][0] if i + 2 < len(words) else total
-        text = ass_escape(" ".join(w[2] for w in grp).upper())
+        nxt = words[i + 2][0] if i + 2 < len(words) else total
+        end = min(nxt, grp[-1][1] + 0.5)
+        text = ass_escape(clean(" ".join(w[2] for w in grp)).upper())
         color = "{\\c&H00F0FF&}" if i % 4 == 0 else ""  # alternate yellow/white
         lines.append(f"Dialogue: 0,{ts(grp[0][0])},{ts(end)},Main,{color}{{\\fscx110\\fscy110\\t(0,80,\\fscx100\\fscy100)}}{text}")
     path.write_text(head + "\n".join(lines), encoding="utf-8")
 
 
-# ---------- 4. Footage ----------
-def twitch_clips(streamers, n=3):
-    """Top Twitch clips of the streamers in the story (no API keys needed) -> [(path, credit)]."""
+# ---------- 6. Footage + render ----------
+def pexels_clips(terms, n=3):
+    if not PEXELS_KEY:
+        return []
     urls = []
-    for name in streamers[:3]:
-        for rng in ("7d", "30d"):
-            r = subprocess.run(["yt-dlp", "--flat-playlist", "--playlist-end", "3", "--print", "url",
-                                f"https://www.twitch.tv/{name}/clips?filter=clips&range={rng}"],
-                               capture_output=True, text=True, timeout=120)
-            found = [u for u in r.stdout.split() if u.startswith("http")]
-            if found:
-                urls += [(u, name) for u in found]
-                break
-            print(f"no clips for {name} ({rng}):", r.stderr.strip()[-200:])
-    # round-robin: best clip of each streamer first, then second-best, ...
-    rank = {}
-    for i, (u, name) in enumerate(urls):
-        rank[u] = sum(1 for _, n in urls[:i] if n == name)
-    urls.sort(key=lambda x: rank[x[0]])
-    out = []
-    for u, name in urls:
-        p = WORK / f"twitch{len(out)}.mp4"
-        r = subprocess.run(["yt-dlp", "-q", "--no-part", "-f", "b", "-o", str(p), u], timeout=300)
-        if r.returncode == 0 and p.exists():
-            out.append((p, f"Clip: twitch.tv/{name}"))
-            print("twitch clip:", u)
-        if len(out) >= n:
-            break
-    return out
-
-
-def pexels_clips(terms, n=5):
-    urls = []
-    for q in terms + ["gaming setup", "neon city night", "esports"]:
+    for q in terms + ["gaming setup", "streamer setup"]:
         r = requests.get("https://api.pexels.com/videos/search",
                          headers={"Authorization": PEXELS_KEY},
                          params={"query": q, "orientation": "portrait", "per_page": 6}, timeout=20)
@@ -315,7 +450,7 @@ def pexels_clips(terms, n=5):
             break
     paths = []
     for k, u in enumerate(urls):
-        p = WORK / f"raw{k}.mp4"
+        p = WORK / f"stock{k}.mp4"
         p.write_bytes(requests.get(u, timeout=120).content)
         paths.append(p)
     return paths
@@ -325,19 +460,34 @@ ZOOM = "zoompan=z='min(zoom+0.0012,1.12)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/z
 FLASH = "fade=t=in:st=0:d=0.15:color=white"
 
 
-def render_part(src, wide, seg, dst):
-    """One segment: slow push-in zoom + white flash on the cut. Wide (16:9) clips sit
-    centered over a blurred copy of themselves instead of being cropped."""
-    if wide:
+def render_part(src, start, length, dst, zoom=True):
+    """One video-only segment. Wide (16:9) clips sit big in the middle over a blurred copy of
+    themselves. B-roll gets a slow push-in; every cut gets a white flash."""
+    fx = f"{ZOOM},{FLASH}" if zoom else f"{FLASH}"
+    if is_wide(src):
         fc = ("[0:v]fps=30,split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,"
-              "crop=1080:1920,boxblur=20:2,eq=brightness=-0.15[bg];[b]scale=1080:-2[fg];"
-              f"[bg][fg]overlay=(W-w)/2:(H-h)/2,{ZOOM},{FLASH}[v]")
+              "crop=1080:1920,boxblur=20:2,eq=brightness=-0.2[bg];"
+              "[b]scale=1440:-2,crop=1080:ih[fg];"  # zoom in a bit so the streamer fills more of the screen
+              f"[bg][fg]overlay=(W-w)/2:(H-h)/2,{fx},setsar=1[v]")
     else:
         fc = (f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,"
-              f"eq=brightness=-0.08,{ZOOM},{FLASH}[v]")
-    subprocess.run(["ffmpeg", "-y", "-v", "error", "-stream_loop", "-1", "-i", str(src), "-t", f"{seg:.2f}",
-                    "-filter_complex", fc, "-map", "[v]", "-an", "-c:v", "libx264", "-preset", "veryfast",
-                    str(dst)], check=True)
+              f"eq=brightness=-0.08,{fx},setsar=1[v]")
+    loop = ["-stream_loop", "-1"] if zoom else []  # b-roll may loop; the main clip never does
+    subprocess.run(["ffmpeg", "-y", "-v", "error", *loop, "-ss", f"{start:.2f}", "-i", str(src),
+                    "-t", f"{length:.2f}", "-filter_complex", fc, "-map", "[v]", "-an",
+                    "-c:v", "libx264", "-preset", "veryfast", "-r", "30", str(dst)], check=True)
+
+
+def make_voice_track(pieces, out):
+    """pieces: [(path, start, length)] -> one normalized wav, played back to back."""
+    cmd, fc = ["ffmpeg", "-y", "-v", "error"], []
+    for k, (p, s, l) in enumerate(pieces):
+        cmd += ["-ss", f"{s:.2f}", "-t", f"{l:.2f}", "-i", str(p)]
+        fc.append(f"[{k}:a]aresample=44100,aformat=channel_layouts=stereo,"
+                  f"loudnorm=I=-15:TP=-1.5:LRA=11,apad=whole_dur={l:.2f}[a{k}]")
+    fc.append("".join(f"[a{k}]" for k in range(len(pieces))) + f"concat=n={len(pieces)}:v=0:a=1[out]")
+    subprocess.run(cmd + ["-filter_complex", ";".join(fc), "-map", "[out]", "-ar", "44100", str(out)],
+                   check=True)
 
 
 def make_whoosh(path):
@@ -380,12 +530,13 @@ def pick_music():
     return (random.choice(local), None) if local else (None, None)
 
 
-def build_video(segments, seg, total, audio, ass, out, music=None):
-    """segments: [(path, wide)] each shown for `seg` seconds."""
+def build_video(sections, voice, total, ass, out, music=None, duck=None):
+    """sections: [(src, start, length, zoom)] played back to back. duck: (start, end) where the
+    real clip plays - music drops so you can hear it."""
     parts = []
-    for k, (src, wide) in enumerate(segments):
+    for k, (src, start, length, zoom) in enumerate(sections):
         p = WORK / f"part{k}.mp4"
-        render_part(src, wide, seg + 0.1, p)
+        render_part(src, start, length, p, zoom)
         parts.append(p)
     lst = WORK / "list.txt"
     lst.write_text("".join(f"file '{p.name}'\n" for p in parts))
@@ -395,29 +546,39 @@ def build_video(segments, seg, total, audio, ass, out, music=None):
 
     whoosh = WORK / "whoosh.wav"
     make_whoosh(whoosh)
-    cuts = [k * seg for k in range(1, len(segments))]
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(bg), "-i", str(audio)]
+    cuts, t = [], 0
+    for _, _, length, _ in sections[:-1]:
+        t += length
+        cuts.append(t)
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(bg), "-i", str(voice)]
     for _ in cuts:
         cmd += ["-i", str(whoosh)]
-    fc = []
-    mix = ["[1:a]"]
-    for n, t in enumerate(cuts):
-        ms = max(0, int((t - 0.2) * 1000))  # whoosh leads into the cut
+    fc, mix = [], ["[1:a]"]
+    for n, c in enumerate(cuts):
+        ms = max(0, int((c - 0.2) * 1000))  # whoosh leads into the cut
         fc.append(f"[{n + 2}:a]adelay={ms}|{ms},volume=0.5[w{n}]")
         mix.append(f"[w{n}]")
     if music:
         cmd += ["-stream_loop", "-1", "-i", str(music)]
-        fc.append(f"[{len(cuts) + 2}:a]volume=0.13,afade=t=out:st={max(0, total - 1.5):.2f}:d=1.5[m]")
+        duck_f = f",volume=0.25:enable='between(t,{duck[0]:.2f},{duck[1]:.2f})'" if duck else ""
+        fc.append(f"[{len(cuts) + 2}:a]volume=0.13{duck_f},afade=t=out:st={max(0, total - 1.5):.2f}:d=1.5[m]")
         mix.append("[m]")
     fc.append(f"{''.join(mix)}amix=inputs={len(mix)}:duration=first:normalize=0[a]")
     fc.append(f"[0:v]ass={ass.name}[v]")
     cmd += ["-filter_complex", ";".join(fc), "-map", "[v]", "-map", "[a]",
-            "-t", f"{total + 0.3:.2f}", "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-t", f"{total:.2f}", "-c:v", "libx264", "-preset", "medium", "-crf", "20",
             "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", str(out)]
     subprocess.run(cmd, check=True, cwd=WORK)
 
 
-# ---------- 5. Upload ----------
+def split_broll(broll, length, max_part=4.5):
+    """Cover `length` seconds with b-roll cuts of <= max_part seconds, rotating sources."""
+    n = max(1, round(length / max_part + 0.49))
+    part = length / n
+    return [(broll[k % len(broll)][0], broll[k % len(broll)][1], part, True) for k in range(n)]
+
+
+# ---------- 7. Upload ----------
 def upload(path, meta):
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
@@ -431,12 +592,12 @@ def upload(path, meta):
     tags = [t if t.startswith("#") else "#" + t for t in meta.get("hashtags", [])]
     hashtags = " ".join(dict.fromkeys(["#shorts", "#viral", "#streamer", "#twitch", "#fyp"] +
                                       [t.replace(" ", "") for t in tags]))
-    credits = "\n".join(meta.get("credits", [])) or "Footage: Pexels"
+    credits = "\n".join(dict.fromkeys(meta.get("credits", []))) or "Footage: Pexels"
     desc = (f"{meta['description']}\n\nCredits:\n{credits}\nNews source: {meta['source']['url']}\n\n"
             f"All clips belong to their respective creators.\n\n{hashtags}")
     body = {"snippet": {"title": meta["title"][:100],
                         "description": desc[:4900],
-                        "tags": meta["tags"], "categoryId": "20"},
+                        "tags": meta.get("tags", []), "categoryId": "20"},
             "status": {"privacyStatus": os.environ.get("YT_PRIVACY", "public"),
                        "selfDeclaredMadeForKids": False}}
     res = yt.videos().insert(part="snippet,status", body=body,
@@ -445,35 +606,95 @@ def upload(path, meta):
     return res["id"]
 
 
+# ---------- main ----------
 def main():
     WORK.mkdir(exist_ok=True)
     history = load_history()
-    items = fetch_reddit() + fetch_google_news()
-    print(f"{len(items)} source items")
-    meta = write_script(items, history)
-    print("Topic:", meta["topic"], f"(viral score {meta.get('viral_score')}/10)", "\nTitle:", meta["title"], "\n", meta["script"])
-    (WORK / "script.txt").write_text(meta["script"], encoding="utf-8")
+    items = fetch_google_news()
+    print(f"{len(items)} news items")
+    story = pick_story(items, history)
+    print(f"Story: {story['source']['title']}  (viral {story.get('viral_score')}/10)")
+    print("Streamers:", story["streamers"])
 
-    audio = WORK / "voice.mp3"
-    words = asyncio.run(tts(meta["script"], audio))
-    total = duration(audio)
+    # Find + download + transcribe the clips most likely to show the moment
+    all_clips = find_clips(story["streamers"])
+    clips = []
+    for c in pick_candidates(story, all_clips):
+        p = WORK / f"clip{len(clips)}.mp4"
+        if download_clip(c, p):
+            c["path"] = p
+            try:
+                c["words"] = transcribe(p)
+            except Exception as e:
+                print("transcribe failed:", e)
+                c["words"] = []
+            clips.append(c)
+    print(f"{len(clips)} clips ready")
 
-    # Real Twitch clips of the streamers first, stock footage fills the rest.
-    tw = twitch_clips([s.lower().strip() for s in meta.get("streamers", [])])
-    stock = pexels_clips(meta["search_terms"], n=max(2, 6 - len(tw)))
-    random.shuffle(stock)
-    segments = [(p, True) for p, _ in tw] + [(p, False) for p in stock]
-    segments = segments[:6]
-    seg = total / len(segments)
-    credit_marks = [(k * seg, (k + 1) * seg, c) for k, (_, c) in enumerate(tw)]
+    meta = write_script(story, clips)
+    meta.update(source=story["source"], topic=story["topic"])
+    idx = meta.get("clip_index", -1)
+    main_clip = clips[idx] if isinstance(idx, int) and 0 <= idx < len(clips) else None
+    print("Title:", meta["title"])
+    print("Intro:", meta["intro"])
+    print("Clip:", main_clip and f"{main_clip['url']} {meta.get('clip_start')}-{meta.get('clip_end')}s "
+          f"(relates: {meta.get('clip_relates')})")
+    print("Outro:", meta.get("outro"))
+
+    # B-roll = the streamer's other clips (muted). Stock footage only if we have no clips at all.
+    broll = [(c["path"], 3.0 if c["duration"] > 10 else 0.0) for c in clips if c is not main_clip]
+    if not broll and main_clip:
+        broll = [(main_clip["path"], 0.0)]
+    stock_used = False
+    if not broll:
+        broll = [(p, 0.0) for p in pexels_clips(meta.get("search_terms", []))]
+        stock_used = bool(broll)
+    if not broll:
+        sys.exit("No footage found at all.")
+    random.shuffle(broll)
+
+    intro_mp3, outro_mp3 = WORK / "intro.mp3", WORK / "outro.mp3"
+    intro_words = tts(meta["intro"], intro_mp3)
+    t1 = duration(intro_mp3)
+    pieces, sections, words, overlays = [(intro_mp3, 0, t1)], split_broll(broll, t1), list(intro_words), []
+    credits = [credit_for(c) for c in clips] + (["Stock footage: Pexels"] if stock_used else [])
+    duck = None
+
+    if main_clip:
+        cs = max(0.0, float(meta.get("clip_start") or 0))
+        ce = min(main_clip["duration"], float(meta.get("clip_end") or cs + 15))
+        if ce - cs < 4:
+            ce = min(main_clip["duration"], cs + 15)
+        t2 = ce - cs
+        pieces.append((main_clip["path"], cs, t2))
+        sections.append((main_clip["path"], cs, t2, False))
+        words += [(s - cs + t1, e - cs + t1, w) for s, e, w in main_clip["words"] if s >= cs and e <= ce]
+        overlays.append((t1, t1 + t2, "Credit", credit_for(main_clip)))
+        if meta.get("clip_label"):
+            overlays.append((t1, t1 + t2, "Label", meta["clip_label"].upper()))
+        duck = (t1, t1 + t2)
+    else:
+        t2 = 0
+
+    total = t1 + t2
+    if meta.get("outro"):
+        outro_words = tts(meta["outro"], outro_mp3)
+        t3 = duration(outro_mp3)
+        pieces.append((outro_mp3, 0, t3))
+        sections += split_broll(broll, t3)
+        words += [(s + total, e + total, w) for s, e, w in outro_words]
+        total += t3
+
+    voice = WORK / "voice.wav"
+    make_voice_track(pieces, voice)
     music, music_credit = pick_music()
-    meta["credits"] = ([c for _, c in tw] + (["Stock footage: Pexels"] if stock else [])
-                       + ([music_credit] if music_credit else []))
+    meta["credits"] = credits + ([music_credit] if music_credit else [])
 
     ass = WORK / "subs.ass"
-    write_ass(words, total, ass, meta.get("hook_text", ""), credit_marks)
+    write_ass(words, total, ass, meta.get("hook_text", ""), overlays)
     out = WORK / "final.mp4"
-    build_video(segments, seg, total, audio, ass, out, music)
+    build_video(sections, voice, total, ass, out, music, duck)
+    print(f"Video: {total:.1f}s")
 
     vid = None if DRY_RUN else upload(out, meta)
     history.append({"date": str(dt.date.today()), "topic": meta["topic"], "title": meta["source"]["title"],
