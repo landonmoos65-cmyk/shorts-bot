@@ -143,7 +143,8 @@ def gemini_models():
         r = requests.get(f"{GEMINI_API}/models", headers={"x-goog-api-key": GEMINI_KEY},
                          params={"pageSize": 200}, timeout=30)
         r.raise_for_status()
-        skip = ("image", "tts", "audio", "live", "embedding", "vision", "thinking", "learnlm", "gemma")
+        skip = ("image", "tts", "audio", "live", "embedding", "vision", "thinking", "learnlm", "gemma",
+                "robotics", "transcribe", "computer-use", "customtools", "-pro", "pro-")
         names = [m["name"] for m in r.json().get("models", [])
                  if "generateContent" in m.get("supportedGenerationMethods", [])
                  and "gemini" in m["name"] and not any(s in m["name"] for s in skip)]
@@ -153,15 +154,27 @@ def gemini_models():
     return _models
 
 
+class Blocked(Exception):
+    """Gemini's safety filter refused this content - retrying won't help."""
+
+
+# Streamer clips swear and joke crudely; use the loosest filter Google allows.
+SAFETY = [{"category": c, "threshold": "BLOCK_NONE"} for c in (
+    "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")]
+
+
 def gemini(prompt, temperature=0.9, images=()):
-    """images: jpeg file paths sent along with the prompt (Gemini can see them)."""
+    """images: jpeg file paths sent along with the prompt (Gemini can see them).
+    Raises Blocked if the safety filter refuses the content on every model."""
     parts = [{"text": prompt}] + [
         {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(Path(p).read_bytes()).decode()}}
         for p in images]
-    body = {"contents": [{"parts": parts}],
+    body = {"contents": [{"parts": parts}], "safetySettings": SAFETY,
             "generationConfig": {"responseMimeType": "application/json", "temperature": temperature}}
     models = gemini_models()
     dead = set()  # models with no free quota (429) - don't retry those
+    blocked = 0
     # Google often returns 503 "high demand" for a few minutes; keep retrying for ~20 min.
     for attempt, wait in enumerate([0, 30, 60, 120, 180, 300, 300, 300]):
         if wait:
@@ -177,15 +190,27 @@ def gemini(prompt, temperature=0.9, images=()):
                 print(f"{model} error: {e}")
                 continue
             if r.ok:
+                data = r.json()
                 try:
-                    return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
-                except (KeyError, IndexError, ValueError) as e:
-                    print(f"{model} bad response: {e}")
+                    return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+                except (KeyError, IndexError, ValueError):
+                    reason = (data.get("promptFeedback", {}).get("blockReason")
+                              or (data.get("candidates") or [{}])[0].get("finishReason") or "empty")
+                    print(f"{model} refused: {reason}")
+                    dead.add(model)
+                    if reason not in ("empty", "MAX_TOKENS"):
+                        blocked += 1
+                        if blocked >= 2:  # two models refused the same content -> it's the content
+                            raise Blocked(reason)
                     continue
             print(f"{model} failed: {r.status_code}")
             if r.status_code in (400, 403, 404, 429):
                 dead.add(model)
-    sys.exit("Gemini unavailable after ~20 minutes - it will try again at the next run.")
+        if len(dead) >= len(models):
+            break
+    if blocked:
+        raise Blocked("refused by all models")
+    sys.exit("Gemini unavailable (busy or out of free quota) - it will try again at the next run.")
 
 
 # ---------- 3. Clips ----------
@@ -359,7 +384,7 @@ def as_timestamped_text(words):
 
 
 # ---------- 4. Script ----------
-def write_script(story, clips, feedback=None, rejected=None):
+def write_script(story, clips, feedback=None, rejected=None, use_images=True):
     blocks, images = [], []
     for i, c in enumerate(clips):
         seen = "no image"
@@ -431,7 +456,7 @@ Return JSON: {{"clip_index": int, "clip_relates": bool, "clip_start": float, "cl
                    + "\n".join(f"- {p}" for p in feedback))
     if rejected:
         prompt += (f"\n\nCLIPS ALREADY REJECTED BY THE FACT-CHECKER: {rejected}. Pick a DIFFERENT clip.")
-    return gemini(prompt, temperature=0.7, images=images)
+    return gemini(prompt, temperature=0.7, images=images if use_images else ())
 
 
 def verify(story, meta, clip, attempt):
@@ -791,7 +816,14 @@ def main():
     #    better to skip a day than post something bad.
     feedback, rejected, passed = None, [], False
     for attempt in range(4):
-        meta = write_script(story, clips, feedback, rejected)
+        try:
+            meta = write_script(story, clips, feedback, rejected)
+        except Blocked:
+            print("Script request blocked by Gemini's safety filter - retrying without frames")
+            try:
+                meta = write_script(story, clips, feedback, rejected, use_images=False)
+            except Blocked:
+                sys.exit("Gemini refused these clips (safety filter) - trying again next run.")
         idx = meta.get("clip_index", -1)
         main_clip = clips[idx] if isinstance(idx, int) and 0 <= idx < len(clips) else None
         if not main_clip:
@@ -802,7 +834,13 @@ def main():
             main_clip["duration"])
         print(f"Try #{attempt + 1}: {main_clip['name']} - {main_clip['url']} "
               f"{meta.get('clip_start')}-{meta.get('clip_end')}s\n  Intro: {meta.get('intro')}")
-        passed, problems = verify(story, meta, main_clip, attempt)
+        try:
+            passed, problems = verify(story, meta, main_clip, attempt)
+        except Blocked as e:  # the fact-checker can't even look at it -> never post it
+            print(f"Fact-check blocked ({e}) - skipping this clip")
+            rejected.append(idx)
+            feedback, passed = None, False
+            continue
         print(f"Fact-check #{attempt + 1}: {'PASSED' if passed else 'FAILED'}", *problems, sep="\n  ")
         if passed:
             break
