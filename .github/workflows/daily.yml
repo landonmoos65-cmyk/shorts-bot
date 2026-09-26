@@ -1,10 +1,9 @@
 name: Daily Short
 
 on:
-  schedule:  # 3 Shorts a day (times in UTC = 11 AM, 4 PM, 8 PM US Eastern)
-    - cron: "0 15 * * *"
-    - cron: "0 20 * * *"
-    - cron: "0 0 * * *"
+  schedule:  # 2 Shorts a day (times in UTC = 12 PM and 7 PM US Eastern)
+    - cron: "0 16 * * *"
+    - cron: "0 23 * * *"
   workflow_dispatch:        # "Run workflow" button for manual tests
 
 permissions:
