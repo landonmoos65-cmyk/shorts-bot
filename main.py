@@ -323,6 +323,26 @@ def transcribe(path):
     return [(w.start, w.end, w.word.strip()) for s in segs for w in (s.words or []) if w.word.strip()]
 
 
+def snap_window(words, cs, ce, dur, lo=8.0, hi=25.0):
+    """Move the cut points to real sentence boundaries so the clip never starts or ends
+    mid-sentence. A boundary = sentence punctuation or a pause > 0.7s."""
+    if not words:
+        return cs, ce
+    n = len(words)
+    starts = [0] + [i for i in range(1, n)
+                    if words[i - 1][2][-1:] in ".?!" or words[i][0] - words[i - 1][1] > 0.7]
+    ends = [i for i in range(n)
+            if words[i][2][-1:] in ".?!" or i == n - 1 or words[i + 1][0] - words[i][1] > 0.7]
+    si = max([i for i in starts if words[i][0] <= cs + 0.4], default=0)
+    new_cs = max(0.0, words[si][0] - 0.15)
+    ei = min([i for i in ends if words[i][1] >= ce - 0.4], default=n - 1)
+    new_ce = words[ei][1] + 0.4
+    if new_ce - new_cs > hi:  # too long: end at the latest boundary that still fits
+        fit = [i for i in ends if lo <= words[i][1] + 0.4 - new_cs <= hi]
+        new_ce = words[max(fit)][1] + 0.4 if fit else new_cs + hi
+    return round(new_cs, 2), round(min(new_ce, dur), 2)
+
+
 def as_timestamped_text(words):
     """Compact transcript: a timestamp every ~sentence so Gemini can pick exact cut points."""
     out, line = [], []
@@ -384,10 +404,10 @@ STEP 2 - write:
 - intro: 20-35 words (~9s). SENTENCE 1: streamer name + the most shocking thing, under 12 words.
   Then only the context needed to understand the clip, then a setup like "Watch what happened."
   Every claim must be visible/audible in the clip or stated in the news. Don't repeat the clip's lines.
-- outro: 8-15 words: one punchy line + a question that makes people comment. LOOP IT: make the
-  outro's last words flow naturally back into the intro's first sentence, so when the Short
-  replays it sounds continuous (e.g. outro "...and nobody saw what came next when" -> intro
-  "Kai Cenat just got banned..."). Only if it still sounds natural.
+- outro: 8-15 words, COMPLETE sentences: one punchy line + a question that makes people comment
+  (e.g. "Kai did not hold back. Was he right, or did he go too far?").
+- Describe what happens accurately: no exaggeration ("last second", "massive", "insane") unless the
+  clip clearly shows it.
 - Pick the format that fits: {formats}
 
 RULES: Never invent quotes/numbers/events/backstory. Rumors = "reportedly". No insults or
@@ -434,7 +454,10 @@ THE VIDEO:
    with the on-screen label "{meta.get('clip_label')}".
    EXACT words spoken in the part we show ({cs:.1f}s-{ce:.1f}s): "{said}"
    (just before it: "...{before}")  (just after it: "{after}...")
-   The attached image = 3 frames from the start, middle and end of that part.
+   The attached image = 3 frames from the start, middle and end of that part, taken from the RAW
+   stream. Our captions are NOT in these frames - any text you see is the streamer's own overlay,
+   chat, or game UI, so don't judge caption accuracy from it.
+   The start/end were already snapped to sentence boundaries by software.
 3. Narrator outro: "{meta.get('outro')}"
 4. Title: "{meta.get('title')}"
 
@@ -774,6 +797,9 @@ def main():
         if not main_clip:
             print("Gemini found no usable clip.")
             break
+        meta["clip_start"], meta["clip_end"] = snap_window(
+            main_clip["words"], float(meta.get("clip_start") or 0), float(meta.get("clip_end") or 15),
+            main_clip["duration"])
         print(f"Try #{attempt + 1}: {main_clip['name']} - {main_clip['url']} "
               f"{meta.get('clip_start')}-{meta.get('clip_end')}s\n  Intro: {meta.get('intro')}")
         passed, problems = verify(story, meta, main_clip, attempt)
