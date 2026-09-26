@@ -358,14 +358,26 @@ def snap_window(words, cs, ce, dur, lo=8.0, hi=25.0):
                     if words[i - 1][2][-1:] in ".?!" or words[i][0] - words[i - 1][1] > 0.7]
     ends = [i for i in range(n)
             if words[i][2][-1:] in ".?!" or i == n - 1 or words[i + 1][0] - words[i][1] > 0.7]
+    def start_at(i):  # a little lead-in, but never into the previous word
+        prev_end = words[i - 1][1] if i > 0 else 0.0
+        return max(0.0, prev_end + 0.02, words[i][0] - 0.15)
+
+    def end_at(i):  # a little tail, but never into the next word
+        nxt = words[i + 1][0] if i + 1 < n else dur
+        return min(dur, words[i][1] + 0.35, nxt - 0.03)
+
     si = max([i for i in starts if words[i][0] <= cs + 0.4], default=0)
-    new_cs = max(0.0, words[si][0] - 0.15)
-    ei = min([i for i in ends if words[i][1] >= ce - 0.4], default=n - 1)
-    new_ce = words[ei][1] + 0.4
-    if new_ce - new_cs > hi:  # too long: end at the latest boundary that still fits
-        fit = [i for i in ends if lo <= words[i][1] + 0.4 - new_cs <= hi]
-        new_ce = words[max(fit)][1] + 0.4 if fit else new_cs + hi
-    return round(new_cs, 2), round(min(new_ce, dur), 2)
+    ei = min([i for i in ends if i >= si and words[i][1] >= ce - 0.4], default=n - 1)
+    new_cs = start_at(si)
+    if end_at(ei) - new_cs > hi:  # too long: end at the latest sentence end that still fits
+        fit = [i for i in ends if i >= si and lo <= end_at(i) - new_cs <= hi]
+        ei = max(fit) if fit else ei
+    return round(new_cs, 2), round(end_at(ei), 2)
+
+
+def words_in(words, cs, ce):
+    """Exactly the words inside the cut - the same ones the viewer hears and the captions show."""
+    return [(s, e, w) for s, e, w in words if s >= cs - 0.05 and e <= ce + 0.05]
 
 
 def as_timestamped_text(words):
@@ -463,9 +475,10 @@ def verify(story, meta, clip, attempt):
     """Fact-check: does the clip segment really deliver what the narration promises?
     -> (passed, [problems])"""
     cs, ce = float(meta.get("clip_start") or 0), float(meta.get("clip_end") or 0)
-    said = " ".join(w for s, e, w in clip["words"] if s >= cs - 0.3 and e <= ce + 0.3) or "(no speech)"
-    before = " ".join(w for s, e, w in clip["words"] if cs - 8 <= s < cs - 0.3)
-    after = " ".join(w for s, e, w in clip["words"] if ce + 0.3 < e <= ce + 6)
+    inside = words_in(clip["words"], cs, ce)
+    said = " ".join(w for _, _, w in inside) or "(no speech)"
+    before = " ".join(w for s, e, w in clip["words"] if cs - 8 <= s and e < cs - 0.05)
+    after = " ".join(w for s, e, w in clip["words"] if s > ce + 0.05 and s <= ce + 6)
     sheet = contact_sheet(clip, f"verify{attempt}", times=(cs + 0.5, (cs + ce) / 2, ce - 0.5))
     data = gemini(f"""You are a strict fact-checker for a streamer-news YouTube Short. Be skeptical.
 
@@ -491,7 +504,9 @@ a) Does the clip part actually deliver what the intro promises? If the intro say
    said about Y" / "listen to his response" / "watch what happened", the words and frames must
    really be X's response about Y / that event - not a random moment, not a different topic.
 b) Is the person speaking/shown plausibly the streamer the video claims? (channel, frames, words)
-c) Does the part start and end cleanly (not mid-sentence, the key line isn't cut off)?
+c) Is the MEANING complete - does the viewer get the key line/punchline? Our software already
+   cuts exactly at word boundaries, so do NOT fail for timestamp nitpicks or tiny trims; only fail
+   if the important part of the moment is missing.
 d) Are all facts in intro/outro/title/label supported by the news or the clip (transcript+frames)?
    Any invented quote, number, event or backstory = fail.
 f) Is this actually worth watching - a clear, interesting moment a viewer understands in 3 seconds?
@@ -891,7 +906,7 @@ def main():
         t2 = ce - cs
         pieces.append((main_clip["path"], cs, t2))
         sections.append((main_clip["path"], cs, t2, False))
-        clip_words = [(s - cs + t1, e - cs + t1, w) for s, e, w in main_clip["words"] if s >= cs and e <= ce]
+        clip_words = [(s - cs + t1, e - cs + t1, w) for s, e, w in words_in(main_clip["words"], cs, ce)]
         words += clip_words
         bleeps = [(max(0, s - 0.05), e + 0.05) for s, e, w in clip_words
                   if SLURS.match(re.sub(r"[^\w]", "", w))]
