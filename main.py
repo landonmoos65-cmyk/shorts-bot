@@ -154,6 +154,10 @@ def gemini_models():
     return _models
 
 
+_last_ok = [None]       # model that answered last time
+_out_of_quota = set()   # models that said 429/404 this run
+
+
 class Blocked(Exception):
     """Gemini's safety filter refused this content - retrying won't help."""
 
@@ -172,8 +176,9 @@ def gemini(prompt, temperature=0.9, images=()):
         for p in images]
     body = {"contents": [{"parts": parts}], "safetySettings": SAFETY,
             "generationConfig": {"responseMimeType": "application/json", "temperature": temperature}}
-    models = gemini_models()
-    dead = set()  # models with no free quota (429) - don't retry those
+    # Try the model that last worked first; skip models that ran out of quota earlier this run.
+    models = sorted(gemini_models(), key=lambda m: m != _last_ok[0])
+    dead = set(_out_of_quota)
     blocked = 0
     # Google often returns 503 "high demand" for a few minutes; keep retrying for ~20 min.
     for attempt, wait in enumerate([0, 30, 60, 120, 180, 300, 300, 300]):
@@ -192,7 +197,9 @@ def gemini(prompt, temperature=0.9, images=()):
             if r.ok:
                 data = r.json()
                 try:
-                    return json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+                    out = json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
+                    _last_ok[0] = model
+                    return out
                 except (KeyError, IndexError, ValueError):
                     reason = (data.get("promptFeedback", {}).get("blockReason")
                               or (data.get("candidates") or [{}])[0].get("finishReason") or "empty")
@@ -206,6 +213,7 @@ def gemini(prompt, temperature=0.9, images=()):
             print(f"{model} failed: {r.status_code}")
             if r.status_code in (400, 403, 404, 429):
                 dead.add(model)
+                _out_of_quota.add(model)  # remembered for the rest of this run
         if len(dead) >= len(models):
             break
     if blocked:
@@ -469,6 +477,38 @@ Return JSON: {{"clip_index": int, "clip_relates": bool, "clip_start": float, "cl
     if rejected:
         prompt += (f"\n\nCLIPS ALREADY REJECTED BY THE FACT-CHECKER: {rejected}. Pick a DIFFERENT clip.")
     return gemini(prompt, temperature=0.7, images=images if use_images else ())
+
+
+def repair_script(story, meta, clip, problems):
+    """Cheap fix: keep the same clip + cut, only rewrite the text the fact-checker complained about."""
+    cs, ce = float(meta["clip_start"]), float(meta["clip_end"])
+    said = " ".join(w for _, _, w in words_in(clip["words"], cs, ce)) or "(no speech)"
+    fixed = gemini(f"""Fix this YouTube Short's text. A fact-checker found problems. Keep the same clip.
+
+CLIP ({clip['name']}'s channel) - exact words the viewer hears: "{said}"
+RECENT NEWS (only allowed source besides the clip): {story['news'] or '(none)'}
+
+CURRENT TEXT:
+intro: {meta.get('intro')}
+outro: {meta.get('outro')}
+title: {meta.get('title')}
+hook_text: {meta.get('hook_text')}
+clip_label: {meta.get('clip_label')}
+description: {meta.get('description')}
+
+PROBLEMS TO FIX:
+{chr(10).join('- ' + p for p in problems)}
+
+Rules: only claim what the clip's words show or the news states. Get WHO said/did what exactly
+right. No exaggeration. Intro 20-35 words starting with the streamer's name + the key moment, ending
+with a setup like "Watch what happened." Outro 8-15 words, complete sentences, ending with a
+question. Title under 60 chars ending with " #shorts".
+Return JSON with the same keys: {{"intro", "outro", "title", "hook_text", "clip_label", "description"}}""",
+                   temperature=0.3)
+    for k in ("intro", "outro", "title", "hook_text", "clip_label", "description"):
+        if isinstance(fixed.get(k), str) and fixed[k].strip():
+            meta[k] = fixed[k].strip()
+    return meta
 
 
 def verify(story, meta, clip, attempt):
@@ -829,40 +869,46 @@ def main():
 
     # 4. Pick + write -> fact-check -> fix (up to 4 tries). Nothing passes = no video today:
     #    better to skip a day than post something bad.
-    feedback, rejected, passed = None, [], False
-    for attempt in range(4):
+    #    Per clip: write -> check -> (repair the text -> check again) -> else next clip. Max 3 clips.
+    rejected, passed, checks = [], False, 0
+    for clip_try in range(3):
         try:
-            meta = write_script(story, clips, feedback, rejected)
+            meta = write_script(story, clips, None, rejected)
         except Blocked:
             print("Script request blocked by Gemini's safety filter - retrying without frames")
             try:
-                meta = write_script(story, clips, feedback, rejected, use_images=False)
+                meta = write_script(story, clips, None, rejected, use_images=False)
             except Blocked:
                 sys.exit("Gemini refused these clips (safety filter) - trying again next run.")
         idx = meta.get("clip_index", -1)
         main_clip = clips[idx] if isinstance(idx, int) and 0 <= idx < len(clips) else None
-        if not main_clip:
-            print("Gemini found no usable clip.")
+        if not main_clip or idx in rejected:
+            print("Gemini found no more usable clips.")
             break
         meta["clip_start"], meta["clip_end"] = snap_window(
             main_clip["words"], float(meta.get("clip_start") or 0), float(meta.get("clip_end") or 15),
             main_clip["duration"])
-        print(f"Try #{attempt + 1}: {main_clip['name']} - {main_clip['url']} "
-              f"{meta.get('clip_start')}-{meta.get('clip_end')}s\n  Intro: {meta.get('intro')}")
-        try:
-            passed, problems = verify(story, meta, main_clip, attempt)
-        except Blocked as e:  # the fact-checker can't even look at it -> never post it
-            print(f"Fact-check blocked ({e}) - skipping this clip")
-            rejected.append(idx)
-            feedback, passed = None, False
-            continue
-        print(f"Fact-check #{attempt + 1}: {'PASSED' if passed else 'FAILED'}", *problems, sep="\n  ")
+        print(f"Clip #{clip_try + 1}: {main_clip['name']} - {main_clip['url']} "
+              f"{meta['clip_start']}-{meta['clip_end']}s\n  Intro: {meta.get('intro')}")
+        for fix in range(2):  # first check, then one repair + re-check
+            checks += 1
+            try:
+                passed, problems = verify(story, meta, main_clip, checks)
+            except Blocked as e:  # the fact-checker can't even look at it -> never post it
+                print(f"Fact-check blocked ({e}) - skipping this clip")
+                passed, problems = False, []
+                break
+            print(f"Fact-check #{checks}: {'PASSED' if passed else 'FAILED'}", *problems, sep="\n  ")
+            if passed or fix == 1 or not problems:
+                break
+            try:
+                meta = repair_script(story, meta, main_clip, problems)
+                print(f"  Repaired intro: {meta.get('intro')}\n  Repaired outro: {meta.get('outro')}")
+            except Blocked:
+                break
         if passed:
             break
-        feedback = problems
-        if attempt >= 1:  # same clip failed twice -> move on to another clip
-            rejected.append(idx)
-            feedback = None
+        rejected.append(idx)
     if not passed:
         sys.exit("No clip passed the fact-check today - skipping instead of posting a bad video.")
     meta.update(source={"title": main_clip["title"], "url": main_clip["url"]},
