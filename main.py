@@ -208,17 +208,75 @@ def gemini(prompt, temperature=0.9, images=()):
                     if reason not in ("empty", "MAX_TOKENS"):
                         blocked += 1
                         if blocked >= 2:  # two models refused the same content -> it's the content
+                            out = groq(prompt, temperature, images)
+                            if out is not None:
+                                return out
                             raise Blocked(reason)
                     continue
             print(f"{model} failed: {r.status_code}")
             if r.status_code in (400, 403, 404, 429):
                 dead.add(model)
                 _out_of_quota.add(model)  # remembered for the rest of this run
+        # Gemini didn't answer this round -> ask the backup (Groq) before waiting around
+        out = groq(prompt, temperature, images)
+        if out is not None:
+            return out
         if len(dead) >= len(models):
             break
     if blocked:
         raise Blocked("refused by all models")
-    sys.exit("Gemini unavailable (busy or out of free quota) - it will try again at the next run.")
+    sys.exit("Gemini AND Groq unavailable - it will try again at the next run.")
+
+
+# ---------- Backup AI: Groq (free, used only when Gemini can't answer) ----------
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_API = "https://api.groq.com/openai/v1"
+_groq_models = None
+
+
+def groq_models():
+    """Chat models on this Groq key, best first. Vision-capable ones are marked."""
+    global _groq_models
+    if _groq_models is None:
+        _groq_models = []
+        try:
+            r = requests.get(f"{GROQ_API}/models", headers={"Authorization": f"Bearer {GROQ_KEY}"}, timeout=30)
+            r.raise_for_status()
+            skip = ("whisper", "tts", "guard", "playai", "distil", "embed", "orpheus", "prompt")
+            ids = [m["id"] for m in r.json().get("data", []) if m.get("active", True)
+                   and not any(s in m["id"].lower() for s in skip)]
+            size = lambda i: max([int(x) for x in re.findall(r"(\d+)b", i.lower())] or [0])
+            _groq_models = sorted(ids, key=lambda i: (size(i), "maverick" in i or "scout" in i), reverse=True)
+            print("Groq backup models:", _groq_models[:5])
+        except Exception as e:
+            print("Groq model list failed:", e)
+    return _groq_models
+
+
+def groq(prompt, temperature=0.7, images=()):
+    """Same job as gemini(), on Groq. Returns parsed JSON or None. Frames are sent only to
+    models that can see images; others get the text (transcripts are the main evidence anyway)."""
+    if not GROQ_KEY:
+        return None
+    for model in groq_models()[:4]:
+        vision = any(v in model.lower() for v in ("vision", "scout", "maverick", "llama-4"))
+        content = [{"type": "text", "text": prompt}]
+        if vision and images:
+            content += [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," +
+                         base64.b64encode(Path(p).read_bytes()).decode()}} for p in list(images)[:5]]
+        try:
+            r = requests.post(f"{GROQ_API}/chat/completions", timeout=180,
+                              headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                              json={"model": model, "temperature": temperature,
+                                    "response_format": {"type": "json_object"},
+                                    "messages": [{"role": "user", "content": content if vision and images else prompt}]})
+            if r.ok:
+                print(f"Using backup AI: Groq {model}" + ("" if vision or not images else " (text only)"))
+                return json.loads(r.json()["choices"][0]["message"]["content"])
+            print(f"groq {model} failed: {r.status_code} {r.text[:150]}")
+        except Exception as e:
+            print(f"groq {model} error: {e}")
+    return None
 
 
 # ---------- 3. Clips ----------
