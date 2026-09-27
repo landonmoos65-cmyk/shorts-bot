@@ -106,7 +106,7 @@ def update_views(history, max_checks=15):
     for h in todo:
         r = subprocess.run([sys.executable, "-m", "yt_dlp", "--skip-download", "--print", "view_count",
                             f"https://www.youtube.com/shorts/{h['video']}"],
-                           capture_output=True, text=True, timeout=90)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
         v = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
         if v.isdigit():
             h["views"] = int(v)
@@ -280,38 +280,38 @@ def groq(prompt, temperature=0.7, images=()):
 
 
 # ---------- 3. Clips ----------
-def list_twitch(user):
+def list_twitch(user, ranges=("7d",), limit=6):
     clips = []
-    for rng in ("7d",):
-        r = subprocess.run([sys.executable, "-m", "yt_dlp", "--flat-playlist", "--playlist-end", "6", "--print",
+    for rng in ranges:
+        r = subprocess.run([sys.executable, "-m", "yt_dlp", "--flat-playlist", "--playlist-end", str(limit), "--print",
                             "%(title)s\t%(duration)s\t%(view_count)s\t%(url)s",
                             f"https://www.twitch.tv/{user}/clips?filter=clips&range={rng}"],
-                           capture_output=True, text=True, timeout=180)
-        for line in r.stdout.splitlines():
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
+        for line in (r.stdout or "").splitlines():
             parts = line.split("\t")
             if len(parts) == 4 and parts[3].startswith("http"):
                 clips.append({"title": parts[0], "duration": float(parts[1] or 0),
                               "views": int(parts[2] or 0) if parts[2].isdigit() else 0,
                               "url": parts[3], "platform": "twitch", "user": user, "range": rng})
-        if len(clips) >= 8:
+        if len(clips) >= limit + 2:
             break
     return clips
 
 
-def list_kick(user):
+def list_kick(user, ranges=("week",), limit=6):
     clips = []
     try:
         from curl_cffi import requests as cffi  # gets past Kick's Cloudflare
-        for rng in ("week",):
+        for rng in ranges:
             r = cffi.get(f"https://kick.com/api/v2/channels/{user}/clips", impersonate="chrome",
                          params={"cursor": 0, "sort": "view", "time": rng}, timeout=30)
-            for c in r.json().get("clips", [])[:6]:
+            for c in r.json().get("clips", [])[:limit]:
                 url = c.get("video_url") or c.get("clip_url")
                 if url:
                     clips.append({"title": c.get("title") or "", "duration": float(c.get("duration") or 0),
                                   "views": int(c.get("view_count") or 0), "url": url,
                                   "platform": "kick", "user": user, "range": rng})
-            if len(clips) >= 8:
+            if len(clips) >= limit + 2:
                 break
     except Exception as e:
         print(f"kick {user} failed: {e}")
@@ -858,6 +858,7 @@ def split_broll(broll, length, max_part=4.5):
 
 
 # ---------- 7. Upload ----------
+BASE_HASHTAGS = ["#shorts", "#viral", "#streamer", "#twitch", "#fyp"]  # other bots can override
 def upload(path, meta):
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
@@ -869,7 +870,7 @@ def upload(path, meta):
                         client_secret=os.environ["YT_CLIENT_SECRET"])
     yt = build("youtube", "v3", credentials=creds)
     tags = [t if t.startswith("#") else "#" + t for t in meta.get("hashtags", [])]
-    hashtags = " ".join(dict.fromkeys(["#shorts", "#viral", "#streamer", "#twitch", "#fyp"] +
+    hashtags = " ".join(dict.fromkeys(BASE_HASHTAGS +
                                       [t.replace(" ", "") for t in tags]))
     credits = "\n".join(dict.fromkeys(meta.get("credits", []))) or "Footage: Pexels"
     desc = (f"{meta['description']}\n\nCredits:\n{credits}\nOriginal clip: {meta['source']['url']}\n\n"
@@ -879,10 +880,20 @@ def upload(path, meta):
                         "tags": meta.get("tags", []), "categoryId": "20"},
             "status": {"privacyStatus": os.environ.get("YT_PRIVACY", "public"),
                        "selfDeclaredMadeForKids": False}}
-    res = yt.videos().insert(part="snippet,status", body=body,
-                             media_body=MediaFileUpload(str(path), resumable=True)).execute()
-    print("Uploaded: https://youtube.com/shorts/" + res["id"])
-    return res["id"]
+    for attempt in range(4):  # network hiccups / YouTube 5xx: wait and try again
+        try:
+            res = yt.videos().insert(part="snippet,status", body=body,
+                                     media_body=MediaFileUpload(str(path), resumable=True)).execute()
+            print("Uploaded: https://youtube.com/shorts/" + res["id"])
+            return res["id"]
+        except Exception as e:
+            msg = str(e)
+            if "quotaExceeded" in msg or "uploadLimitExceeded" in msg:
+                sys.exit("YouTube daily upload limit reached - the video will be made again next run.")
+            if attempt == 3:
+                raise
+            print(f"Upload failed ({msg[:200]}) - retrying in {60 * (attempt + 1)}s")
+            time.sleep(60 * (attempt + 1))
 
 
 # ---------- main ----------
