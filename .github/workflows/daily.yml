@@ -1,10 +1,11 @@
 name: Daily Short
 
 on:
-  schedule:  # 2 Shorts a day (times in UTC = 12 PM and 7 PM US Eastern)
-    - cron: "0 16 * * *"
-    - cron: "0 23 * * *"
-  workflow_dispatch:        # "Run workflow" button for manual tests
+  schedule:  # 2 Shorts a day, about 12 PM and 7 PM US Eastern. Odd minutes on purpose: GitHub
+             # delays or drops scheduled runs at busy times like the top of the hour.
+    - cron: "7 16 * * *"
+    - cron: "7 23 * * *"
+  workflow_dispatch:        # "Run workflow" button for manual runs
 
 permissions:
   contents: write
@@ -16,15 +17,29 @@ concurrency:  # never run two at once (they'd fight over history.json)
 jobs:
   make-short:
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip                      # faster installs
+      - uses: actions/cache@v4            # keep the Whisper model between runs (saves ~1 min + a download)
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-models-v1
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu
-      - run: pip install -r requirements.txt
-      - run: python main.py
+      - run: pip install -U -r requirements.txt   # -U: always newest yt-dlp (Twitch/Kick changes)
+      - name: Make and post the Short (up to 3 tries)
+        run: |
+          for i in 1 2 3; do
+            echo "================ Attempt $i of 3 ================"
+            rm -rf work
+            if python main.py; then echo "Posted on attempt $i"; exit 0; fi
+            if [ $i -lt 3 ]; then echo "Attempt $i didn't post - waiting 8 min, then trying fresh clips"; sleep 480; fi
+          done
+          echo "All 3 attempts failed - check the log above"
+          exit 1
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -33,6 +48,7 @@ jobs:
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           YT_PRIVACY: ${{ vars.YT_PRIVACY || 'public' }}
+          WATERMARK: ${{ vars.WATERMARK }}
       - uses: actions/upload-artifact@v5
         if: always()
         with:
